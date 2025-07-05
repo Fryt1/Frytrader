@@ -76,4 +76,13 @@ target/
 # cache
 tmp/
 
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+frytrader_env/
+.venv/
+
 secrets/
