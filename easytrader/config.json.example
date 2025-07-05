@@ -1,0 +1,8 @@
+{
+  "user": "你的用户名",
+  "password": "你的密码",
+  "exe_path": "C:\\通达信\\xiadan.exe",
+  "comm_password": "通讯密码",
+  "client_type": "通用同花顺",
+  "account_file": "C:\\通达信\\Account.ini"
+}
