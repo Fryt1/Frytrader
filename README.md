@@ -37,6 +37,25 @@ pip install easytrader[all]
 pip install .
 ```
 
+## 配置说明
+
+1. 复制配置文件模板:
+```bash
+cp easytrader/config.json.example config.json
+```
+
+2. 编辑config.json文件:
+```json
+{
+  "user": "您的账号",
+  "password": "您的密码",
+  "exe_path": "您的交易客户端路径\\xiadan.exe",
+  "comm_password": "您的通讯密码",
+  "client_type": "universal_client",
+  "account_file": "您的账户文件路径\\Account.ini"
+}
+```
+
 ## 快速开始
 
 ### 基本使用

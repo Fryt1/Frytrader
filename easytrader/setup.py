@@ -4,7 +4,7 @@ setup(
     name="easytrader",
     version="0.24.0",
     description="A utility for China Stock Trade",
-    long_description=open("README.md").read(),
+    long_description=open("../README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="shidenggui",
     author_email="longlyshidenggui@gmail.com",

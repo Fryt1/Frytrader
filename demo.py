@@ -12,7 +12,7 @@ if easytrader_path not in sys.path:
 
 import easytrader
 
-config_files = "config.json"
+config_files = "Frytrader\config.json"
 
 user = easytrader.use('universal_client') # pyright: ignore[reportAttributeAccessIssue]
 

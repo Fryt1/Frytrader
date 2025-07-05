@@ -1,8 +1,9 @@
 {
-  "user": "你的用户名",
-  "password": "你的密码",
-  "exe_path": "C:\\通达信\\xiadan.exe",
-  "comm_password": "通讯密码",
-  "client_type": "通用同花顺",
-  "account_file": "C:\\通达信\\Account.ini"
+  "user": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD", 
+  "exe_path": "PATH_TO_YOUR_TRADE_CLIENT\\xiadan.exe",
+  "comm_password": "YOUR_COMM_PASSWORD",
+  "client_type": "universal_client",
+  "account_file": "PATH_TO_YOUR_ACCOUNT_FILE\\Account.ini",
+  "tips": "请根据实际情况修改以上配置项"
 }
