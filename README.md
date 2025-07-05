@@ -1,6 +1,6 @@
-# EasyTrader 量化交易工具
+# EasyTrader 量化## 安装
 
-[![PyPI Version](https://img.shields.io/pypi/v/easytrader.svg)](https://pypi.python.org/pypi/easytrader)
+详细的安装步骤请参考：[📋 安装指南 (INSTALL.md)](./INSTALL.md) Version](https://img.shields.io/pypi/v/easytrader.svg)](https://pypi.python.org/pypi/easytrader)
 [![Python Version](https://img.shields.io/pypi/pyversions/easytrader.svg)](https://pypi.python.org/pypi/easytrader)
 [![License](https://img.shields.io/github/license/shidenggui/easytrader.svg)](https://github.com/shidenggui/easytrader/blob/master/LICENSE)
 
@@ -15,7 +15,7 @@
 
 ## 安装
 
-### 从源码安装
+### 快速安装
 
 ```bash
 git clone https://github.com/Fryt1/Frytrader.git
@@ -23,17 +23,11 @@ cd Frytrader
 pip install -e .
 ```
 
-**详细安装指南请参考**: [INSTALL.md](./INSTALL.md)
+### 📋 完整安装指南
 
-### 功能扩展安装
+**详细的安装步骤（包含虚拟环境配置、依赖安装、常见问题等）请参考**: [INSTALL.md](./INSTALL.md)
 
-```bash
-# 安装miniQMT支持
-pip install easytrader[all]
-
-# 或者安装特定功能  
-pip install easytrader[miniqmt]
-```
+> 💡 **强烈推荐**: 使用虚拟环境安装，避免依赖冲突！详见安装指南。
 
 ## 配置说明
 
