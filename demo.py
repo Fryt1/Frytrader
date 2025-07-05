@@ -14,7 +14,7 @@ import easytrader
 
 config_files = "config.json"
 
-user = easytrader.use('universal_client')
+user = easytrader.use('universal_client') # pyright: ignore[reportAttributeAccessIssue]
 
 user.prepare(config_files)
 

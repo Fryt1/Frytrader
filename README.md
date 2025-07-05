@@ -1,74 +1,103 @@
-# EasyTrader 3.0
+# EasyTrader 量化交易工具
 
-这是基于原版 easytrader 的修改版本，专注于股票量化交易。
+[![PyPI Version](https://img.shields.io/pypi/v/easytrader.svg)](https://pypi.python.org/pypi/easytrader)
+[![Python Version](https://img.shields.io/pypi/pyversions/easytrader.svg)](https://pypi.python.org/pypi/easytrader)
+[![License](https://img.shields.io/github/license/shidenggui/easytrader.svg)](https://github.com/shidenggui/easytrader/blob/master/LICENSE)
 
 ## 功能特性
 
-- 进行股票量化交易
-- 通用的同花顺客户端模拟操作
-- 支持券商的 miniqmt 官方量化接口
-- 支持雪球组合调仓和跟踪
-- 支持远程操作客户端
-- 支持跟踪 joinquant, ricequant 的模拟交易
-- 增强的验证码识别功能
+- 支持多种券商客户端自动化交易
+- 雪球组合调仓和跟踪
+- 支持券商官方量化接口(miniQMT)
+- 远程操作客户端
+- 自动验证码识别
+- 支持跟踪JoinQuant/RiceQuant模拟交易
 
-## 项目结构
+## 安装
 
-```
-easytrader3.0/
-├── easytrader/           # 主要的 easytrader 库
-├── captcha_debug/        # 验证码调试文件
-├── config.json          # 配置文件
-├── demo.py              # 演示文件
-├── debug_captcha.py     # 验证码调试脚本
-└── test_captcha.py      # 验证码测试脚本
+### 开发者安装
+```bash
+git clone https://github.com/Fryt1/Frytrader.git
+cd Frytrader
+pip install -e .
 ```
 
-## 安装和使用
+### 普通用户安装
+```bash
+pip install git+https://github.com/Fryt1/Frytrader.git
+```
 
-### 安装依赖
+### 功能扩展安装
 
 ```bash
-pip install -r easytrader/requirements.txt
+# 安装miniQMT支持
+pip install easytrader[all]
+
+# 基础安装已包含验证码等核心功能
+pip install .
 ```
 
-### 验证码功能
-
-如果需要使用验证码识别功能：
-
-```bash
-pip install -r easytrader/requirements-captcha.txt
-```
+## 快速开始
 
 ### 基本使用
 
 ```python
 import easytrader
 
-# 创建交易客户端
-trader = easytrader.use('ht')
-trader.prepare('config.json')
+# 创建交易对象
+user = easytrader.use('ths')  # 同花顺客户端
+user.connect(r'C:\xiadan.exe')  # 客户端路径
 
-# 进行交易操作
-# ...
+# 查询账户
+print(user.balance)
+print(user.position)
+
+# 交易操作
+user.buy('601318', price=50, amount=100)  # 买入
+user.sell('601318', price=55, amount=100) # 卖出
 ```
 
-## 配置
+### 验证码功能
 
-复制 `easytrader/config.json.example` 到 `config.json` 并填入你的配置信息。
+验证码功能已默认集成，支持同花顺客户端自动化交易：
+
+1. **自动检测**: 检测包含"验证码"文字的窗口
+2. **图片截取**: 自动截取验证码图片
+3. **智能识别**: 使用 Tesseract-OCR 识别验证码
+4. **自动输入**: 将识别结果输入到验证码输入框
+5. **重试机制**: 失败时最多重试 5 次
+
+#### 环境准备
+- 安装 Tesseract-OCR (Windows: https://github.com/UB-Mannheim/tesseract/wiki)
+- 确保 Tesseract 路径在系统 PATH 中
+
+#### 技术细节
+- 验证码图片控件ID: `0x965`
+- 验证码输入框控件ID: `0x964`
+- 识别引擎: Tesseract-OCR
+- 重试次数: 最多 5 次
+- 超时设置: 每次识别超时 1 秒
+
+#### 故障排除
+1. **Tesseract 未找到**
+   - 确保已安装 Tesseract-OCR
+   - 检查 PATH 环境变量
+2. **验证码识别失败**
+   - 检查图片质量
+   - 尝试调整 Tesseract 参数
+
+### 雪球组合跟踪
+
+```python
+follower = easytrader.follower('xq')
+follower.login(user='username', password='password')
+follower.follow('组合URL', total_assets=100000)
+```
 
 ## 文档
 
-更详细的使用文档请参考 [easytrader 文档](https://easytrader.readthedocs.io/)
+详细文档请参考: [https://easytrader.readthedocs.io](https://easytrader.readthedocs.io)
 
-## 许可证
+## 问题反馈
 
-请查看 `easytrader/LICENSE` 文件了解许可证信息。
-
-## 贡献
-
-欢迎提交 Issues 和 Pull Requests。
-
-## 免责声明
-
-本项目仅供学习和研究使用，使用本项目进行实际交易产生的任何损失，作者不承担任何责任。请在使用前充分了解相关风险。
+如有问题请提交issue: [https://github.com/shidenggui/easytrader/issues](https://github.com/shidenggui/easytrader/issues)
