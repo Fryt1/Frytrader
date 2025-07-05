@@ -1,7 +1,7 @@
 {
-  "user": "YOUR_USERNAME",
-  "password": "YOUR_PASSWORD", 
-  "exe_path": "PATH_TO_YOUR_TRADE_CLIENT\\xiadan.exe",
+  "user": "15923042018",
+  "password": "100861", 
+  "exe_path": "E:\\tonghuashun\\同花顺\\xiadan.exe",
   "comm_password": "YOUR_COMM_PASSWORD",
   "client_type": "universal_client",
   "account_file": "PATH_TO_YOUR_ACCOUNT_FILE\\Account.ini",
