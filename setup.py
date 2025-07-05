@@ -1,10 +1,10 @@
-from setuptools import setup
+from setuptools import setup, find_packages
 
 setup(
     name="easytrader",
     version="0.24.0",
     description="A utility for China Stock Trade",
-    long_description=open("../README.md", encoding="utf-8").read(),
+    long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="shidenggui",
     author_email="longlyshidenggui@gmail.com",
@@ -51,12 +51,8 @@ setup(
         "Programming Language :: Python :: 3.6",
         "License :: OSI Approved :: BSD License",
     ],
-    packages=[
-        "easytrader",
-        "easytrader.config",
-        "easytrader.utils",
-        "easytrader.miniqmt"
-    ],
+    packages=find_packages(where="core"),
+    package_dir={"": "core"},
     package_data={
         "": ["*.jar", "*.json"],
         "config": ["config/*.json"],

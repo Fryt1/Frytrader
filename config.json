@@ -1,0 +1,18 @@
+{
+    "user": "YOUR_USERNAME",
+    "password": "YOUR_PASSWORD",
+    "exe_path": "YOUR_TRADING_SOFTWARE_PATH",
+    "comm_password": "YOUR_COMM_PASSWORD",
+    "account": "YOUR_ACCOUNT_NUMBER",
+    "portfolio": "default",
+    "captcha": {
+        "tesseract_path": "C:/Program Files/Tesseract-OCR/tesseract.exe",
+        "retry_times": 3,
+        "manual_input": true,
+        "recognition_config": {
+            "whitelist": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            "psm": 8,
+            "oem": 3
+        }
+    }
+}
