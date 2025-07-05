@@ -3,19 +3,16 @@ import sys
 import os
 import json
 
-# 添加easytrader模块路径到Python搜索路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-easytrader_path = os.path.join(current_dir, 'easytrader')
-if easytrader_path not in sys.path:
-    sys.path.insert(0, easytrader_path)
-
-
+# 导入已安装的 easytrader 模块
 import easytrader
 
-config_files = "Frytrader\config.json"
+# 配置文件路径（相对于当前目录）
+config_files = "config.json"
 
-user = easytrader.use('universal_client') # pyright: ignore[reportAttributeAccessIssue]
+# 创建交易对象
+user = easytrader.use('universal_client')
 
+# 准备连接（使用配置文件）
 user.prepare(config_files)
 
 balance = user.balance

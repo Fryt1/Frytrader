@@ -15,17 +15,15 @@
 
 ## 安装
 
-### 开发者安装
+### 从源码安装
+
 ```bash
 git clone https://github.com/Fryt1/Frytrader.git
 cd Frytrader
 pip install -e .
 ```
 
-### 普通用户安装
-```bash
-pip install git+https://github.com/Fryt1/Frytrader.git
-```
+**详细安装指南请参考**: [INSTALL.md](./INSTALL.md)
 
 ### 功能扩展安装
 
@@ -33,32 +31,67 @@ pip install git+https://github.com/Fryt1/Frytrader.git
 # 安装miniQMT支持
 pip install easytrader[all]
 
-# 基础安装已包含验证码等核心功能
-pip install .
+# 或者安装特定功能  
+pip install easytrader[miniqmt]
 ```
 
 ## 配置说明
 
-1. 复制配置文件模板:
+1. 复制配置文件模板：
 ```bash
-cp easytrader/config.json.example config.json
+cp config.json.example config.json
 ```
 
-2. 编辑config.json文件:
+2. 编辑 config.json 文件，将占位符替换为您的实际信息：
 ```json
 {
-  "user": "您的账号",
-  "password": "您的密码",
-  "exe_path": "您的交易客户端路径\\xiadan.exe",
-  "comm_password": "您的通讯密码",
-  "client_type": "universal_client",
-  "account_file": "您的账户文件路径\\Account.ini"
+  "user": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD",
+  "exe_path": "YOUR_TRADING_SOFTWARE_PATH",
+  "comm_password": "YOUR_COMM_PASSWORD",
+  "account": "YOUR_ACCOUNT_NUMBER",
+  "portfolio": "default",
+  "captcha": {
+    "tesseract_path": "C:/Program Files/Tesseract-OCR/tesseract.exe",
+    "retry_times": 3,
+    "manual_input": true,
+    "recognition_config": {
+      "whitelist": "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+      "psm": 8,
+      "oem": 3
+    }
+  }
+}
 }
 ```
 
 ## 快速开始
 
-### 基本使用
+### 运行示例
+
+项目包含一个 `demo.py` 示例文件，展示了基本用法：
+
+```python
+import easytrader
+
+# 配置文件路径
+config_files = "config.json"
+
+# 创建交易对象
+user = easytrader.use('universal_client')
+
+# 准备连接（使用配置文件）
+user.prepare(config_files)
+
+# 查询账户信息
+balance = user.balance
+print(f"✅ 账户余额: {balance}")
+
+position = user.position
+print(f"✅ 仓位: {position}")
+```
+
+### 基本交易操作
 
 ```python
 import easytrader
