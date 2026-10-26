@@ -88,6 +88,7 @@ class ClientTrader(IClientTrader):
         self._app = None
         self._main = None
         self._toolbar = None
+        self._grid_strategy_instance = None
 
     @property
     def app(self):
@@ -455,12 +456,11 @@ class ClientTrader(IClientTrader):
         self.wait(0.1)
 
         # 设置交易所
-        # if security.lower().startswith("sz"):
-        #     self._set_stock_exchange_type("深圳Ａ股")
-        # if security.lower().startswith("sh"):
-        #     self._set_stock_exchange_type("上海Ａ股")
-        #
-        # self.wait(0.1)
+        if security.lower().startswith("sz"):
+            self._set_stock_exchange_type("深圳Ａ股")
+        if security.lower().startswith("sh"):
+            self._set_stock_exchange_type("上海Ａ股")
+        self.wait(0.1)
 
         self._type_edit_control_keys(
             self._config.TRADE_PRICE_CONTROL_ID,
@@ -590,6 +590,7 @@ class BaseLoginClientTrader(ClientTrader):
         password=None,
         exe_path=None,
         comm_password=None,
+        captcha=None,
         **kwargs
     ):
         """
@@ -599,6 +600,7 @@ class BaseLoginClientTrader(ClientTrader):
         :param password: 明文密码
         :param exe_path: 客户端路径类似 r'C:\\htzqzyb2\\xiadan.exe', 默认 r'C:\\htzqzyb2\\xiadan.exe'
         :param comm_password: 通讯密码
+        :param captcha: 验证码识别配置
         :return:
         """
         if config_path is not None:
@@ -607,6 +609,7 @@ class BaseLoginClientTrader(ClientTrader):
             password = account["password"]
             comm_password = account.get("comm_password")
             exe_path = account.get("exe_path")
+            captcha = account.get("captcha", captcha)
         self.login(
             user,
             password,
@@ -615,3 +618,8 @@ class BaseLoginClientTrader(ClientTrader):
             **kwargs
         )
         self._init_toolbar()
+        if captcha:
+            strategy = self.grid_strategy_instance
+            configure = getattr(strategy, "configure_captcha", None)
+            if configure is not None:
+                configure(captcha)

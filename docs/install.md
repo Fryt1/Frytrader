@@ -21,15 +21,21 @@
 
 或者你也可以手动登陆后在通过 `easytrader` 调用，此时 `easytrader` 在登陆过程中会直接识别到已登陆的窗口。
 
-### 安装
+### 安装本 fork
+
+从 Frytrader 仓库根目录运行：
 
 ```shell
-pip install easytrader
+python -m pip install -e .
 ```
 
-### 升级
+不要同时安装 PyPI 上的原版 `easytrader`，两者都会提供 `easytrader` 导入包。验证码识别还需要单独安装 Tesseract OCR；配置方式见仓库根目录的 `config.json.example`。
+
+### MiniQMT 可选依赖
 
 ```shell
-pip install easytrader -U
+python -m pip install -e ".[miniqmt]"
 ```
+
+这只安装 Python 依赖，不会授予券商权限或解除券商限制。
 

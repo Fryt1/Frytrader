@@ -1,0 +1,12 @@
+{
+  "user": "YOUR_USERNAME",
+  "password": "YOUR_PASSWORD",
+  "exe_path": "C:/path/to/xiadan.exe",
+  "comm_password": "YOUR_COMM_PASSWORD",
+  "captcha": {
+    "mode": "balanced",
+    "manual_input": false,
+    "save_debug_samples": false,
+    "tesseract_path": null
+  }
+}

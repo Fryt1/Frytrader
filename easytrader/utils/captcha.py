@@ -101,3 +101,78 @@ def invoke_tesseract_to_recognize(img):
         )
     valid_chars = re.findall("[0-9a-z]", res, re.IGNORECASE)
     return "".join(valid_chars)
+
+
+def normalize_captcha_result(text, expected_length=4):
+    """规范化识别文本，仅返回长度正确的字母数字验证码。"""
+    result = "".join(re.findall(r"[0-9a-z]", str(text), re.IGNORECASE))
+    return result if len(result) == expected_length else ""
+
+
+def select_captcha_candidate(candidates, expected_length=4):
+    """从多次 OCR 结果中选择唯一多数候选。"""
+    from collections import Counter
+
+    normalized = [
+        result
+        for result in (
+            normalize_captcha_result(candidate, expected_length)
+            for candidate in candidates
+        )
+        if result
+    ]
+    if not normalized:
+        return ""
+
+    counts = Counter(normalized)
+    highest = max(counts.values())
+    winners = [result for result, count in counts.items() if count == highest]
+    return winners[0] if len(winners) == 1 else ""
+
+
+def captcha_recognize_improved(
+    image_path, expected_length=4, tesseract_path=None
+):
+    """尝试多种轻量图像预处理，仍不确定时返回空结果。"""
+    from PIL import ImageEnhance, ImageFilter, ImageOps
+    import pytesseract
+
+    previous_tesseract_path = pytesseract.pytesseract.tesseract_cmd
+    try:
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+        image = Image.open(image_path).convert("L")
+        scaled = image.resize((image.width * 2, image.height * 2))
+        variants = [
+            scaled,
+            ImageOps.autocontrast(scaled),
+            ImageEnhance.Contrast(scaled).enhance(2.0),
+            ImageEnhance.Sharpness(scaled).enhance(2.0),
+            scaled.filter(ImageFilter.MedianFilter(size=3)),
+        ]
+        candidates = []
+        whitelist = (
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz"
+        )
+
+        for variant in variants:
+            for page_mode in (8, 7):
+                config = (
+                    "--oem 3 --psm {} -c tessedit_char_whitelist={}".format(
+                        page_mode, whitelist
+                    )
+                )
+                text = pytesseract.image_to_string(variant, config=config)
+                result = normalize_captcha_result(text, expected_length)
+                if result:
+                    candidates.append(result)
+        return select_captcha_candidate(candidates, expected_length)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "未找到 Tesseract，请安装 Tesseract 或检查 tesseract_path 配置"
+        ) from exc
+    finally:
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = previous_tesseract_path
