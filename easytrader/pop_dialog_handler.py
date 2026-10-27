@@ -82,17 +82,31 @@ class TradePopDialogHandler(PopDialogHandler):
                 self._submit_by_shortcut()
                 return None
 
-            return None
+            # 无法识别的提示信息：关闭它并明确回报内容，
+            # 既不能当作成功，也不能留在界面上让上层反复遇到同一个弹窗。
+            self._close()
+            return {"message": content}
 
         if title == "提示":
             content = self._extract_content()
             if "成功" in content:
-                entrust_no = self._extract_entrust_id(content)
+                match = re.search(r"[\da-zA-Z]+", content)
+                entrust_no = match.group() if match else ""
                 self._submit_by_click()
+                if not entrust_no:
+                    raise exceptions.TradeError(
+                        "提示成功但未解析到委托编号: {}".format(content)
+                    )
                 return {"entrust_no": entrust_no}
 
             self._submit_by_click()
             time.sleep(0.05)
             raise exceptions.TradeError(content)
+
+        # 其它弹窗：关闭并回报，避免上层反复遇到同一个未处理弹窗
+        content = self._extract_content()
         self._close()
-        return None
+        return {
+            "message": "unknown message: {}({})".format(title, content),
+            "result": "unknown",
+        }

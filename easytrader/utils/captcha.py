@@ -133,8 +133,17 @@ def select_captcha_candidate(candidates, expected_length=4):
 def captcha_recognize_improved(
     image_path, expected_length=4, tesseract_path=None
 ):
-    """尝试多种轻量图像预处理，仍不确定时返回空结果。"""
-    from PIL import ImageEnhance, ImageFilter, ImageOps
+    """尝试多种图像预处理，用多数投票选择结果，仍不确定时返回空结果。
+
+    验证码区分大小写，因此不能做大小写归一；投票按原样比较。
+    对同花顺这类蓝字白底的验证码，蓝通道反相 + 多阈值二值化能显著提高准确率。
+
+    注意：验证码有较短的存活时间，串行跑完全部变体约需 5 秒，会导致验证码
+    在提交前就失效。这里用线程池并行调用 tesseract，把耗时压到 1 秒左右。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from PIL import Image, ImageOps
     import pytesseract
 
     previous_tesseract_path = pytesseract.pytesseract.tesseract_cmd
@@ -142,32 +151,59 @@ def captcha_recognize_improved(
         if tesseract_path:
             pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
-        image = Image.open(image_path).convert("L")
-        scaled = image.resize((image.width * 2, image.height * 2))
-        variants = [
-            scaled,
-            ImageOps.autocontrast(scaled),
-            ImageEnhance.Contrast(scaled).enhance(2.0),
-            ImageEnhance.Sharpness(scaled).enhance(2.0),
-            scaled.filter(ImageFilter.MedianFilter(size=3)),
-        ]
-        candidates = []
+        image = Image.open(image_path)
+        gray = image.convert("L")
+        scale = 3
+        size = (gray.width * scale, gray.height * scale)
+        big = gray.resize(size, Image.LANCZOS)
+
+        variants = [big, ImageOps.autocontrast(big)]
+
+        # 蓝色字符：取蓝通道反相后文字变黑、背景变白
+        try:
+            _, _, blue = image.convert("RGB").split()
+            inverted = ImageOps.invert(blue).resize(size, Image.LANCZOS)
+            variants.append(inverted)
+            variants.append(ImageOps.autocontrast(inverted))
+        except Exception:
+            pass
+
+        # 多个阈值二值化
+        for threshold in (100, 140, 180):
+            variants.append(
+                big.point(lambda p, t=threshold: 0 if p < t else 255)
+            )
+
         whitelist = (
             "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             "abcdefghijklmnopqrstuvwxyz"
         )
 
-        for variant in variants:
-            for page_mode in (8, 7):
-                config = (
-                    "--oem 3 --psm {} -c tessedit_char_whitelist={}".format(
-                        page_mode, whitelist
-                    )
+        def recognize_one(task):
+            variant, page_mode = task
+            config = (
+                "--oem 3 --psm {} -c tessedit_char_whitelist={}".format(
+                    page_mode, whitelist
                 )
+            )
+            try:
                 text = pytesseract.image_to_string(variant, config=config)
-                result = normalize_captcha_result(text, expected_length)
-                if result:
-                    candidates.append(result)
+            except Exception:
+                return ""
+            return normalize_captcha_result(text, expected_length)
+
+        tasks = [
+            (variant, page_mode)
+            for variant in variants
+            for page_mode in (7, 8, 6, 13)
+        ]
+
+        # tesseract 会启动子进程，线程池即可获得接近线性的加速
+        workers = min(8, max(1, len(tasks)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            candidates = list(executor.map(recognize_one, tasks))
+        candidates = [result for result in candidates if result]
+
         return select_captcha_candidate(candidates, expected_length)
     except FileNotFoundError as exc:
         raise RuntimeError(

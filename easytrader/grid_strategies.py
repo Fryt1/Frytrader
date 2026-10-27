@@ -1,25 +1,96 @@
 # -*- coding: utf-8 -*-
 import abc
+import hashlib
 import io
+import os
+import shutil
 import tempfile
+import time
 from io import StringIO
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import pandas as pd
-import pywinauto.keyboard
 import pywinauto
 import pywinauto.clipboard
+import pywinauto.keyboard
 
 from easytrader.log import logger
 from easytrader.utils.captcha import (
     captcha_recognize_improved,
     input_verify_code_manual,
 )
-from easytrader.utils.win_gui import SetForegroundWindow, ShowWindow, win32defines
+from easytrader.utils.win_gui import (
+    SetForegroundWindow,
+    ShowWindow,
+    win32defines,
+)
 
 if TYPE_CHECKING:
     # pylint: disable=unused-import
     from easytrader import clienttrader
+
+
+def _top_level_windows_of(app) -> List[int]:
+    """返回指定应用进程的所有顶层窗口句柄（按 Z 序，从前到后）。"""
+    process_id = None
+    try:
+        process_id = app.process
+    except Exception:
+        return []
+
+    handles = []
+    try:
+        import win32gui
+        import win32process
+
+        def _collect(hwnd, _):
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                if pid == process_id:
+                    handles.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(_collect, None)
+    except Exception:
+        logger.debug("枚举顶层窗口失败", exc_info=True)
+    return handles
+
+
+def _drop_empty_rows(df: "pd.DataFrame") -> List[Dict]:
+    """丢弃全空占位行。
+
+    客户端的虚拟表格在没有数据时仍会导出 1~2 行占位行，
+    这些行的文本列是空字符串、数值列是 0（如 委托数量=0, 委托价格=0.000），
+    直接转 dict 会得到看似合法的假记录，误导调用方以为存在委托/持仓。
+    """
+    if df.empty:
+        return []
+
+    def is_blank(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() == ""
+        # NaN / NaT
+        try:
+            if pd.isna(value):
+                return True
+        except (TypeError, ValueError):
+            pass
+        # 数值 0 视为空占位
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value) == 0.0
+        return False
+
+    keep = [
+        not all(is_blank(value) for value in row)
+        for row in df.itertuples(index=False)
+    ]
+    return df[keep].to_dict("records")
 
 
 class IGridStrategy(abc.ABC):
@@ -39,6 +110,35 @@ class IGridStrategy(abc.ABC):
 
 
 class BaseStrategy(IGridStrategy):
+    """表格抓取策略基类。
+
+    这里集中放各策略共用的验证码处理逻辑，避免 Copy / Xls 各写一份实现，
+    也避免两份实现的行为逐渐走偏（早期 Xls 用 Ctrl+A+Delete 清空验证码框，
+    而该操作在本客户端上无效，会导致重试时内容不断累积）。
+    """
+
+    # 验证码弹窗控件 ID（各券商客户端一致）
+    CAPTCHA_IMAGE_CONTROL_ID = 0x965
+    CAPTCHA_EDIT_CONTROL_ID = 0x964
+    CAPTCHA_OK_BUTTON_ID = 1
+    CAPTCHA_CANCEL_BUTTON_ID = 2
+
+    def _captcha_image(self, dialog):
+        """验证码图片控件。"""
+        return dialog.window(
+            control_id=self.CAPTCHA_IMAGE_CONTROL_ID, class_name="Static"
+        )
+
+    def _captcha_editor(self, dialog):
+        """验证码输入框控件。"""
+        return dialog.window(
+            control_id=self.CAPTCHA_EDIT_CONTROL_ID, class_name="Edit"
+        )
+
+    def _captcha_button(self, dialog, control_id):
+        """验证码弹窗上的按钮（确定/取消）。"""
+        return dialog.window(control_id=control_id, class_name="Button")
+
     def __init__(self):
         self._trader = None
 
@@ -53,22 +153,74 @@ class BaseStrategy(IGridStrategy):
         """
         pass
 
-    def _get_grid(self, control_id: int):
-        grid = self._trader.main.child_window(
-            control_id=control_id, class_name="CVirtualGridCtrl"
-        )
-        return grid
+    @staticmethod
+    def _fill_captcha(editor, code):
+        """把验证码写入输入框。
 
-    def _set_foreground(self, grid=None):
+        两个实测得到的硬约束，缺一就会导致验证码永远失败：
+
+        1. 该控件对 set_edit_text / WM_SETTEXT 无效，写入后内容仍为空，
+           必须用 type_keys 模拟键盘输入；
+        2. Ctrl+A / Delete 在该控件上同样无效，清不掉上一次的错误内容。
+           若不先真正清空，重试时会在旧内容后面继续追加，
+           例如 "R2ku" + "R2ku" 变成 "R2kuR2ku"，每次都必然被拒绝。
+           只有 BACKSPACE 能逐字符删除，所以这里按足够次数退格。
+        """
+        editor.set_focus()
+        # 验证码只有 4 位，退格次数留足余量以清掉历史累积内容
+        for _ in range(16):
+            editor.type_keys("{BACKSPACE}", set_foreground=False)
+        editor.type_keys(code, set_foreground=False, pause=0.05)
+
+    def _set_foreground(self, control=None):
         try:
-            if grid is None:
-                grid = self._trader.main
-            if grid.has_style(win32defines.WS_MINIMIZE):  # if minimized
-                ShowWindow(grid.wrapper_object(), 9)  # restore window state
+            if control is None:
+                control = self._trader.main
+            # 既可能传入控件包装对象，也可能传入 element info
+            window = (
+                control.wrapper_object()
+                if hasattr(control, "wrapper_object")
+                else control
+            )
+            if control.has_style(win32defines.WS_MINIMIZE):  # if minimized
+                ShowWindow(window, 9)  # restore window state
             else:
-                SetForegroundWindow(grid.wrapper_object())  # bring to front
-        except:
-            pass
+                SetForegroundWindow(window)  # bring to front
+        except Exception:
+            logger.debug("置前窗口失败", exc_info=True)
+
+    def _get_grid(self, control_id: int):
+        """返回当前唯一可见的表格控件。
+
+        交易客户端会在后台保留多个同 control_id 的表格控件（每个查询页一个），
+        直接 child_window 查找会命中多个而抛出 ElementAmbiguousError，
+        这里按可见性过滤，避免在页面切换后静默失败。
+        """
+        candidates = []
+        for control in self._trader.main.descendants():
+            try:
+                if (
+                    control.class_name() == "CVirtualGridCtrl"
+                    and control.control_id() == control_id
+                    and control.is_visible()
+                ):
+                    candidates.append(control)
+            except Exception:  # 控件可能在遍历过程中销毁
+                continue
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if not candidates:
+            raise RuntimeError(
+                "未找到可见的表格控件 (control_id={})".format(control_id)
+            )
+
+        raise RuntimeError(
+            "存在 {} 个可见的表格控件 (control_id={})，无法确定目标".format(
+                len(candidates), control_id
+            )
+        )
 
 
 class Copy(BaseStrategy):
@@ -81,7 +233,15 @@ class Copy(BaseStrategy):
     def get(self, control_id: int) -> List[Dict]:
         grid = self._get_grid(control_id)
         self._set_foreground(grid)
+        # 先清空剪贴板，否则复制失败时会读到上一次的旧数据
+        try:
+            pywinauto.clipboard.EmptyClipboard()
+        except Exception:
+            logger.debug("清空剪贴板失败", exc_info=True)
+
+        grid.set_focus()
         grid.type_keys("^A^C", set_foreground=False, pause=0.2)
+
         content = self._get_clipboard_data()
         return self._format_grid_data(content)
 
@@ -93,64 +253,158 @@ class Copy(BaseStrategy):
                 dtype=self._trader.config.GRID_DTYPE,
                 na_filter=False,
             )
-            return df.to_dict("records")
-        except:
+            return _drop_empty_rows(df)
+        except Exception:
+            logger.exception("解析表格内容失败")
             Copy._need_captcha_reg = True
+            raise
+
+    def _get_captcha_dialog(self):
+        """返回验证码弹窗，未出现时返回 None。
+
+        该弹窗没有窗口标题（标题栏文本在 Static 控件里），因此不能按 title 查找；
+        而且它可能被主交易窗口盖住（不是 top_window），所以遍历进程内所有顶层窗口，
+        用「验证码图片控件」这一特征来识别。
+        """
+        for handle in _top_level_windows_of(self._trader.app):
+            try:
+                window = self._trader.app.window(handle=handle)
+                if self._captcha_image(window).exists(timeout=0.05):
+                    return window
+            except Exception:
+                continue
+        return None
+
+    def _wait_captcha_dialog(self, timeout=2.0):
+        """复制被拦截时验证码弹窗是异步弹出的，需要等待。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            dialog = self._get_captcha_dialog()
+            if dialog is not None:
+                return dialog
+            self._trader.wait(0.1)
+        return None
+
+    def _solve_captcha(self, max_retry=8):
+        """处理验证码弹窗，返回 True 表示已通过。
+
+        单次 OCR 准确率约 8 成，因此识别失败（空结果）时应直接换一张验证码，
+        而不是把空内容提交上去白白消耗一次机会。
+        """
+        dialog = self._wait_captcha_dialog()
+        if dialog is None:
+            # 没有弹窗，说明本次复制没有被拦截
+            return True
+
+        attempts = 0
+        while attempts < max_retry:
+            dialog = self._get_captcha_dialog()
+            if dialog is None:
+                return True
+
+            attempts += 1
+            try:
+                # 弹窗可能被主窗口盖住，务必提到前台再操作
+                self._set_foreground(dialog)
+                self._trader.wait(0.2)
+
+                image_path = os.path.join(
+                    tempfile.gettempdir(), "easytrader_captcha.png"
+                )
+                self._captcha_image(dialog).capture_as_image().save(image_path)
+
+                captcha_num = captcha_recognize_improved(image_path).strip()
+                captcha_num = "".join(captcha_num.split())
+                logger.info("第 %s 次识别验证码 -> %s", attempts, captcha_num)
+
+                if len(captcha_num) != 4:
+                    # 识别不出结果：直接换一张，不要提交空值
+                    logger.warning("验证码识别未得到 4 位结果，换一张重试")
+                    self._refresh_captcha(dialog)
+                    continue
+
+                self._fill_captcha(self._captcha_editor(dialog), captcha_num)
+                self._trader.wait(0.1)
+                self._captcha_button(dialog, self.CAPTCHA_OK_BUTTON_ID).click()
+                self._trader.wait(0.6)
+
+                if self._get_captcha_dialog() is None:
+                    logger.info("验证码通过：%s", captcha_num)
+                    return True
+
+                logger.warning("验证码被拒绝：%s", captcha_num)
+                # 被拒后客户端不会自动换图，必须主动刷新，否则会重复提交同一张
+                self._refresh_captcha(self._get_captcha_dialog())
+            except Exception:
+                logger.exception("第 %s 次验证码处理异常", attempts)
+                self._trader.wait(0.2)
+
+        # 放弃本次操作，点取消关掉弹窗，避免主流程卡住
+        logger.error("验证码连续 %s 次失败，取消本次数据获取", max_retry)
+        dialog = self._get_captcha_dialog()
+        if dialog is not None:
+            try:
+                self._captcha_button(
+                    dialog, self.CAPTCHA_CANCEL_BUTTON_ID
+                ).click()
+            except Exception:
+                logger.debug("点击取消失败", exc_info=True)
+        return False
+
+    def _refresh_captcha(self, dialog):
+        """点图片刷新验证码，并确认图片真的变了。
+
+        被拒绝后客户端不会自动换图，如果刷新失败还继续提交，
+        就会反复提交同一张验证码，白白耗尽重试次数。
+        """
+        if dialog is None:
+            return False
+        try:
+            image = self._captcha_image(dialog)
+            before = self._captcha_image_digest(image)
+            image.click()
+            self._trader.wait(0.4)
+            after = self._captcha_image_digest(image)
+            if before and after and before == after:
+                # 再试一次，个别情况下第一次点击不生效
+                image.click()
+                self._trader.wait(0.4)
+                after = self._captcha_image_digest(image)
+            changed = bool(before and after and before != after)
+            if not changed:
+                logger.warning("刷新验证码后图片未变化")
+            return changed
+        except Exception:
+            logger.debug("刷新验证码图片失败", exc_info=True)
+            return False
+
+    def _captcha_image_digest(self, image):
+        """取验证码图片的指纹，用于判断是否已刷新。"""
+        try:
+            buffer = io.BytesIO()
+            image.capture_as_image().save(buffer, format="PNG")
+            return hashlib.md5(buffer.getvalue()).hexdigest()
+        except Exception:
+            return ""
 
     def _get_clipboard_data(self) -> str:
-        if Copy._need_captcha_reg:
-            if (
-                    self._trader.app.top_window().window(class_name="Static", title_re="验证码").exists(timeout=1)
-            ):
-                file_path = "tmp.png"
-                count = 5
-                found = False
-                while count > 0:
-                    self._trader.app.top_window().window(
-                        control_id=0x965, class_name="Static"
-                    ).capture_as_image().save(
-                        file_path
-                    )  # 保存验证码
+        if Copy._need_captcha_reg and not self._solve_captcha():
+            raise RuntimeError("验证码未能通过，无法复制表格数据")
 
-                    captcha_num = captcha_recognize_improved(file_path).strip()
-                    captcha_num = "".join(captcha_num.split())
-                    logger.info("captcha result-->" + captcha_num)
-                    if len(captcha_num) == 4:
-                        editor = self._trader.app.top_window().window(
-                            control_id=0x964, class_name="Edit"
-                        ) # 验证码输入框
-                        editor.set_focus() # 焦点移到验证码输入框 (也可不聚焦防止键盘误触输入，不聚焦type_edit_control_keys也可正常输入)
-                        self._trader.wait(0.1) # 输入前短暂等待
-                        self._trader.type_edit_control_keys(
-                            editor,
-                            captcha_num
-                        )  # 模拟输入验证码
-
-                        self._trader.wait(0.1) # 输完后短暂等待
-                        self._trader.app.top_window().type_keys("{ENTER}", pause=0.1)  # 模拟发送enter，点击确定
-                        if not editor.exists(timeout=1):  # 窗体消失
-                            logger.info("验证码验证成功-->" + captcha_num)
-                            found = True
-                            break
-                    count -= 1
-                    self._trader.wait(0.1)
-                    self._trader.app.top_window().window(
-                        control_id=0x965, class_name="Static"
-                    ).click()
-                if not found:
-                    self._trader.app.top_window().Button2.click()  # 点击取消
-            else:
-                pass
-                # 不要将 Copy._need_captcha_reg 置为 False, 因为它是类方法, 一旦置为 False, 后续操作都不再进行验证码识别
-                # Copy._need_captcha_reg = False
         count = 5
+        last_error = None
         while count > 0:
             try:
                 return pywinauto.clipboard.GetData()
             # pylint: disable=broad-except
             except Exception as e:
+                last_error = e
                 count -= 1
-                logger.exception("%s, retry ......", e)
+                self._trader.wait(0.2)
+                logger.warning("读取剪贴板失败，重试中: %s", e)
+        raise RuntimeError(
+            "复制表格后无法从剪贴板读取数据（可能验证码未通过或表格为空）"
+        ) from last_error
 
 
 class WMCopy(Copy):
@@ -275,18 +529,13 @@ class Xls(BaseStrategy):
         return None
 
     def _handle_captcha(self):
-        import os
-        import shutil
-
         for attempt in range(self.captcha_config["max_retry_count"]):
             image_path = None
             try:
                 handle = tempfile.mkstemp(suffix=".png")
                 image_path = handle[1]
                 os.close(handle[0])
-                captcha = self._trader.app.top_window().window(
-                    control_id=0x965, class_name="Static"
-                )
+                captcha = self._captcha_image(self._trader.app.top_window())
                 captcha.capture_as_image().save(image_path)
 
                 if self.captcha_config["save_debug_samples"]:
@@ -308,10 +557,9 @@ class Xls(BaseStrategy):
                 if len(code) != 4 or not code.isalnum():
                     logger.warning("验证码识别未得到 4 位有效结果")
                 else:
-                    editor = self._trader.app.top_window().window(
-                        control_id=0x964, class_name="Edit"
-                    )
-                    self._trader.type_edit_control_keys(editor, code)
+                    top_window = self._trader.app.top_window()
+                    editor = self._captcha_editor(top_window)
+                    self._fill_captcha(editor, code)
                     self._trader.app.top_window().type_keys(
                         "{ENTER}", set_foreground=False
                     )
@@ -320,11 +568,12 @@ class Xls(BaseStrategy):
                     )
                     for _ in range(wait_steps):
                         self._trader.wait(0.1)
-                        if not self._captcha_visible():
+                        if not self._captcha_visible(timeout=0.05):
                             logger.info("验证码已通过")
                             return
 
-                if self._captcha_visible():
+                # 未通过或被拒绝时刷新验证码，重新识别
+                if self._captcha_visible(timeout=0.1):
                     captcha.click()
                     self._trader.wait(self.captcha_config["refresh_wait_time"])
             except Exception as exc:
@@ -334,14 +583,14 @@ class Xls(BaseStrategy):
                     os.remove(image_path)
 
         try:
-            self._trader.app.top_window().Button2.click()
+            self._captcha_button(
+                self._trader.app.top_window(), self.CAPTCHA_CANCEL_BUTTON_ID
+            ).click()
         except Exception:
-            pass
+            logger.debug("点击取消失败", exc_info=True)
         raise RuntimeError("验证码多次识别失败")
 
     def get(self, control_id: int) -> List[Dict]:
-        import os
-
         try:
             grid = self._get_grid(control_id)
             if not grid.exists():
@@ -433,7 +682,7 @@ class Xls(BaseStrategy):
                 dtype=self._trader.config.GRID_DTYPE,
                 na_filter=False,
             )
-            return df.to_dict("records")
+            return _drop_empty_rows(df)
         except Exception as exc:
             logger.exception("解析导出的表格失败")
             raise ValueError("表格导出文件无法解析") from exc

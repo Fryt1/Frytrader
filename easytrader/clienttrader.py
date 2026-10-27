@@ -13,7 +13,12 @@ import hashlib, binascii
 import easyutils
 from pywinauto import findwindows, timings
 
-from easytrader import grid_strategies, pop_dialog_handler, refresh_strategies
+from easytrader import (
+    exceptions,
+    grid_strategies,
+    pop_dialog_handler,
+    refresh_strategies,
+)
 from easytrader.config import client
 from easytrader.grid_strategies import IGridStrategy
 from easytrader.log import logger
@@ -279,11 +284,19 @@ class ClientTrader(IClientTrader):
                 except:
                     retry += 1
                     self.wait(0.1)
+            else:
+                # 市价类型没选上时绝不能继续提交，
+                # 否则会按客户端残留的旧选项下单，成交价与预期完全不同。
+                raise exceptions.TradeError(
+                    "无法选择市价委托类型: {}，已中止下单".format(ttype)
+                )
         self._set_market_trade_params(security, amount, limit_price=limit_price)
         self._submit_trade()
 
-        return self._handle_pop_dialogs(
-            handler_class=pop_dialog_handler.TradePopDialogHandler
+        return self._require_entrust_result(
+            self._handle_pop_dialogs(
+                handler_class=pop_dialog_handler.TradePopDialogHandler
+            )
         )
 
     def _set_market_trade_type(self, ttype):
@@ -417,8 +430,24 @@ class ClientTrader(IClientTrader):
 
         self._submit_trade()
 
-        return self._handle_pop_dialogs(
-            handler_class=pop_dialog_handler.TradePopDialogHandler
+        return self._require_entrust_result(
+            self._handle_pop_dialogs(
+                handler_class=pop_dialog_handler.TradePopDialogHandler
+            )
+        )
+
+    @staticmethod
+    def _require_entrust_result(result):
+        """下单必须以拿到委托编号为准。
+
+        客户端弹窗关闭并不代表券商已受理，没有委托编号时一律视为结果未知，
+        抛出异常交给人工核对，绝不能返回一个看起来成功的空结果。
+        """
+        if isinstance(result, dict) and result.get("entrust_no"):
+            return result
+        raise exceptions.TradeError(
+            "未获取到委托编号，委托结果未知，请人工核对委托列表。"
+            "客户端返回: {}".format(result)
         )
 
     def _click(self, control_id):
@@ -563,18 +592,34 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def _handle_pop_dialogs(self, handler_class=pop_dialog_handler.PopDialogHandler):
-        handler = handler_class(self._app)
+        """处理交易后的弹窗，返回结果。
 
-        while self.is_exist_pop_dialog():
+        必须在有限次数内结束并给出确定结论：早先的实现里，
+        遇到无法识别的弹窗时既不关闭也不返回，会在 while 循环里一直卡住。
+        """
+        handler = handler_class(self._app)
+        max_rounds = 10
+
+        for _ in range(max_rounds):
+            if not self.is_exist_pop_dialog():
+                # 弹窗已消失，但这里不能断言委托成功，调用方需核对委托列表
+                return None
+
             try:
                 title = self._get_pop_dialog_title()
             except pywinauto.findwindows.ElementNotFoundError:
-                return {"message": "success"}
+                return None
 
             result = handler.handle(title)
             if result:
                 return result
-        return {"message": "success"}
+
+        # 连续处理仍未收敛：关闭残留弹窗并明确报错，不要静默当作成功
+        logger.error("弹窗处理超过 %s 轮仍未结束，可能存在未知提示框", max_rounds)
+        self.close_pop_dialog()
+        raise exceptions.TradeError(
+            "交易弹窗无法确认，委托结果未知，请人工核对委托列表"
+        )
 
 
 class BaseLoginClientTrader(ClientTrader):
