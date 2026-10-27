@@ -17,6 +17,7 @@ import pandas as pd
 
 from easytrader import grid_strategies
 from easytrader.config import client as client_config
+from easytrader.utils import captcha as captcha_utils
 
 GRID_DTYPE = client_config.create("ths").GRID_DTYPE
 
@@ -180,6 +181,7 @@ class TestCaptchaInput(unittest.TestCase):
 
         实测 Ctrl+A / Delete 在该控件上无效，只有 BACKSPACE 能删除。
         如果不清空，重试会拼成 "R2kuR2ku" 之类的 8 位内容，永远无法通过。
+        退格合并成一次 type_keys（"{BACKSPACE 16}"）以减少按键往返开销。
         """
         editor = mock.MagicMock()
         editor.type_keys.side_effect = lambda keys, **kwargs: keys
@@ -187,9 +189,14 @@ class TestCaptchaInput(unittest.TestCase):
         grid_strategies.BaseStrategy._fill_captcha(editor, "Wq7z")
 
         typed = [call.args[0] for call in editor.type_keys.call_args_list]
-        self.assertGreaterEqual(
-            typed.count("{BACKSPACE}"), 4, "退格次数应足以清掉旧内容"
-        )
+        # 必须有一次包含多次退格的调用
+        backspace_calls = [k for k in typed if "BACKSPACE" in k.upper()]
+        self.assertTrue(backspace_calls, "必须先清空旧内容")
+        count = 0
+        for keys in backspace_calls:
+            digits = "".join(ch for ch in keys if ch.isdigit())
+            count += int(digits) if digits else 1
+        self.assertGreaterEqual(count, 4, "退格次数应足以清掉旧内容")
         # 不能依赖无效的 Ctrl+A / Delete
         self.assertNotIn("^a", typed)
         self.assertNotIn("{DELETE}", typed)
@@ -249,6 +256,9 @@ class TestCaptchaSolve(unittest.TestCase):
              mock.patch.object(self.strategy, "_set_foreground"), \
              mock.patch.object(self.strategy, "_refresh_captcha", side_effect=fake_refresh), \
              mock.patch.object(
+                 self.strategy, "_capture_control", return_value=mock.MagicMock()
+             ), \
+             mock.patch.object(
                  grid_strategies, "captcha_recognize_improved", return_value=""
              ):
             self.assertTrue(self.strategy._solve_captcha())
@@ -280,6 +290,44 @@ class TestClipboardFailure(unittest.TestCase):
         with mock.patch.object(self.strategy, "_solve_captcha", return_value=False):
             with self.assertRaises(RuntimeError):
                 self.strategy._get_clipboard_data()
+
+
+class TestCaptchaVoting(unittest.TestCase):
+    """验证码结果聚合：按位置投票，大小写单独投票。
+
+    真实样本里 tesseract 的大小写判断比字符本身更不稳定，
+    整串比较会让多数投票永远选不出结果，因此拆成两个维度投票。
+    """
+
+    def test_majority_character_wins_per_position(self):
+        result = captcha_utils.select_captcha_by_position(
+            ["Abcd", "Abcd", "Abx d".replace(" ", "")]
+        )
+        self.assertEqual(result, "Abcd")
+
+    def test_case_is_voted_separately(self):
+        # 字符一致但大小写不同时，按大写/小写票数决定
+        result = captcha_utils.select_captcha_by_position(
+            ["ECat", "Ecat", "ECat"]
+        )
+        self.assertEqual(result, "ECat")
+
+    def test_minority_case_character_still_kept(self):
+        # 4 个候选里 3 个小写 -> 取小写，但字符本身不受影响
+        result = captcha_utils.select_captcha_by_position(
+            ["ecat", "ecat", "ecat", "ECat"]
+        )
+        self.assertEqual(result, "ecat")
+
+    def test_empty_candidates_returns_empty(self):
+        self.assertEqual(captcha_utils.select_captcha_by_position([]), "")
+        self.assertEqual(
+            captcha_utils.select_captcha_by_position(["", "ab"]), ""
+        )
+
+    def test_wrong_length_candidates_ignored(self):
+        result = captcha_utils.select_captcha_by_position(["Abcd", "xyz"])
+        self.assertEqual(result, "Abcd")
 
 
 if __name__ == "__main__":

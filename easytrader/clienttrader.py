@@ -94,6 +94,8 @@ class ClientTrader(IClientTrader):
         self._main = None
         self._toolbar = None
         self._grid_strategy_instance = None
+        # 记录当前停留的菜单页，用于跳过重复切换
+        self._current_menu_path = None
 
     @property
     def app(self):
@@ -546,13 +548,25 @@ class ClientTrader(IClientTrader):
             item.collapse()
 
     @perf_clock
-    def _switch_left_menus(self, path, sleep=0.2):
+    def _switch_left_menus(self, path, sleep=0.05):
+        """切换到左侧菜单对应的页面。
+
+        两项优化（实测有效）：
+        1. 记录当前页面，同一页面不重复切换，连续查询同一页时省掉整次切换；
+        2. 不再额外发 F5。实测切页后表格数据已是新的，F5 属于多余的一次
+           真实按键——既拖慢速度，又会让窗口抢前台。
+        """
+        target = tuple(path)
+        if getattr(self, "_current_menu_path", None) == target:
+            return
         self.close_pop_dialog()
         self._get_left_menus_handle().get_item(path).select()
-        self._app.top_window().type_keys('{F5}')
+        self._current_menu_path = target
         self.wait(sleep)
 
     def _switch_left_menus_by_shortcut(self, shortcut, sleep=0.5):
+        # 快捷键会改变当前页面，缓存失效
+        self._current_menu_path = None
         self.close_pop_dialog()
         self._app.top_window().type_keys(shortcut)
         self.wait(sleep)

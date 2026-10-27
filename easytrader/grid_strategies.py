@@ -30,6 +30,61 @@ if TYPE_CHECKING:
     from easytrader import clienttrader
 
 
+def _foreground_window():
+    """返回当前前台窗口句柄，取不到时返回 0。"""
+    try:
+        import win32gui
+
+        return win32gui.GetForegroundWindow() or 0
+    except Exception:
+        return 0
+
+
+def _restore_foreground(handle):
+    """把前台还原到指定窗口。
+
+    交易客户端在弹验证码、切换页签时会主动抢前台；读取结束后若不复位，
+    用户的输入焦点就被留在行情软件上，正在打的字会跑到别处。
+    这里用 AttachThreadInput 绕过前台锁定限制，失败也不抛异常。
+    """
+    if not handle:
+        return False
+    try:
+        import win32gui
+        import win32process
+
+        if win32gui.GetForegroundWindow() == handle:
+            return True
+
+        current_thread = win32process.GetWindowThreadProcessId(
+            win32gui.GetForegroundWindow()
+        )[0]
+        target_thread = win32process.GetWindowThreadProcessId(handle)[0]
+        attached = False
+        if current_thread != target_thread:
+            try:
+                win32process.AttachThreadInput(
+                    current_thread, target_thread, True
+                )
+                attached = True
+            except Exception:
+                attached = False
+        try:
+            win32gui.SetForegroundWindow(handle)
+        finally:
+            if attached:
+                try:
+                    win32process.AttachThreadInput(
+                        current_thread, target_thread, False
+                    )
+                except Exception:
+                    pass
+        return win32gui.GetForegroundWindow() == handle
+    except Exception:
+        logger.debug("还原前台窗口失败", exc_info=True)
+        return False
+
+
 def _top_level_windows_of(app) -> List[int]:
     """返回指定应用进程的所有顶层窗口句柄（按 Z 序，从前到后）。"""
     process_id = None
@@ -120,6 +175,7 @@ class BaseStrategy(IGridStrategy):
     # 验证码弹窗控件 ID（各券商客户端一致）
     CAPTCHA_IMAGE_CONTROL_ID = 0x965
     CAPTCHA_EDIT_CONTROL_ID = 0x964
+    CAPTCHA_ERROR_CONTROL_ID = 0x966
     CAPTCHA_OK_BUTTON_ID = 1
     CAPTCHA_CANCEL_BUTTON_ID = 2
 
@@ -138,6 +194,24 @@ class BaseStrategy(IGridStrategy):
     def _captcha_button(self, dialog, control_id):
         """验证码弹窗上的按钮（确定/取消）。"""
         return dialog.window(control_id=control_id, class_name="Button")
+
+    def _capture_control(self, control):
+        """抓取控件图像，返回 PIL Image。
+
+        优先用 PrintWindow：窗口被遮挡、被移到屏幕外，或运行在隐藏桌面时，
+        ImageGrab / capture_as_image 依赖真实屏幕会抛 "screen grab failed"，
+        而 PrintWindow 直接把内容画到内存 DC，不依赖窗口是否显示在屏幕上。
+        失败时回退到 capture_as_image，兼容不支持 PrintWindow 的环境。
+        """
+        from easytrader import screenshot
+
+        hwnd = control.wrapper_object().handle
+        try:
+            screenshot.ensure_rendered(hwnd)
+            return screenshot.print_window(hwnd)
+        except Exception:
+            logger.debug("PrintWindow 抓图失败，改用 capture_as_image", exc_info=True)
+            return control.capture_as_image()
 
     def __init__(self):
         self._trader = None
@@ -167,10 +241,10 @@ class BaseStrategy(IGridStrategy):
            只有 BACKSPACE 能逐字符删除，所以这里按足够次数退格。
         """
         editor.set_focus()
-        # 验证码只有 4 位，退格次数留足余量以清掉历史累积内容
-        for _ in range(16):
-            editor.type_keys("{BACKSPACE}", set_foreground=False)
-        editor.type_keys(code, set_foreground=False, pause=0.05)
+        # 验证码只有 4 位，退格次数留足余量以清掉历史累积内容。
+        # 16 次退格合并成一次 type_keys 发送，避免每个按键的往返开销。
+        editor.type_keys("{BACKSPACE 16}", set_foreground=False, pause=0.005)
+        editor.type_keys(code, set_foreground=False, pause=0.01)
 
     def _set_foreground(self, control=None):
         try:
@@ -232,18 +306,26 @@ class Copy(BaseStrategy):
 
     def get(self, control_id: int) -> List[Dict]:
         grid = self._get_grid(control_id)
-        self._set_foreground(grid)
-        # 先清空剪贴板，否则复制失败时会读到上一次的旧数据
+        # 整个读取过程会短暂激活交易窗口（切菜单、复制、验证码弹窗），
+        # 结束后把前台还给用户原本的窗口，避免打断用户正在做的事。
+        original_foreground = _foreground_window()
         try:
-            pywinauto.clipboard.EmptyClipboard()
-        except Exception:
-            logger.debug("清空剪贴板失败", exc_info=True)
+            self._set_foreground(grid)
+            # 先清空剪贴板，否则复制失败时会读到上一次的旧数据
+            try:
+                pywinauto.clipboard.EmptyClipboard()
+            except Exception:
+                logger.debug("清空剪贴板失败", exc_info=True)
 
-        grid.set_focus()
-        grid.type_keys("^A^C", set_foreground=False, pause=0.2)
+            grid.set_focus()
+            # pause 会按"每个按键"累加等待：^A^C 共 5 个按键，
+            # pause=0.2 时仅这一步就要 1.2 秒，是整条链路最大的单点开销。
+            grid.type_keys("^A^C", set_foreground=False, pause=0.02)
 
-        content = self._get_clipboard_data()
-        return self._format_grid_data(content)
+            content = self._get_clipboard_data()
+            return self._format_grid_data(content)
+        finally:
+            _restore_foreground(original_foreground)
 
     def _format_grid_data(self, data: str) -> List[Dict]:
         try:
@@ -275,14 +357,18 @@ class Copy(BaseStrategy):
                 continue
         return None
 
-    def _wait_captcha_dialog(self, timeout=2.0):
-        """复制被拦截时验证码弹窗是异步弹出的，需要等待。"""
+    def _wait_captcha_dialog(self, timeout=2.0, interval=0.02):
+        """复制被拦截时验证码弹窗是异步弹出的，需要等待。
+
+        用细粒度轮询替代 wait(0.1)：弹窗通常在几十毫秒内就出现，
+        粗粒度等待平均会多花半轮的时间。
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             dialog = self._get_captcha_dialog()
             if dialog is not None:
                 return dialog
-            self._trader.wait(0.1)
+            time.sleep(interval)
         return None
 
     def _solve_captcha(self, max_retry=8):
@@ -304,14 +390,15 @@ class Copy(BaseStrategy):
 
             attempts += 1
             try:
-                # 弹窗可能被主窗口盖住，务必提到前台再操作
+                # 弹窗可能被主窗口盖住，提到前台以便真实键盘输入生效
                 self._set_foreground(dialog)
-                self._trader.wait(0.2)
 
                 image_path = os.path.join(
                     tempfile.gettempdir(), "easytrader_captcha.png"
                 )
-                self._captcha_image(dialog).capture_as_image().save(image_path)
+                self._capture_control(self._captcha_image(dialog)).save(
+                    image_path
+                )
 
                 captcha_num = captcha_recognize_improved(image_path).strip()
                 captcha_num = "".join(captcha_num.split())
@@ -324,15 +411,20 @@ class Copy(BaseStrategy):
                     continue
 
                 self._fill_captcha(self._captcha_editor(dialog), captcha_num)
-                self._trader.wait(0.1)
                 self._captcha_button(dialog, self.CAPTCHA_OK_BUTTON_ID).click()
-                self._trader.wait(0.6)
 
-                if self._get_captcha_dialog() is None:
+                # 轮询等待结果，而不是固定 sleep：
+                # 通过时弹窗消失，被拒时弹窗留在原地并显示"验证码错误!!"。
+                # 只要看到错误提示就可以立刻重试，不必等满超时。
+                outcome = self._wait_captcha_outcome(dialog, timeout=2.0)
+                if outcome == "passed":
                     logger.info("验证码通过：%s", captcha_num)
                     return True
 
-                logger.warning("验证码被拒绝：%s", captcha_num)
+                if outcome == "rejected":
+                    logger.warning("验证码被拒绝：%s", captcha_num)
+                else:
+                    logger.warning("验证码结果未知，按拒绝处理：%s", captcha_num)
                 # 被拒后客户端不会自动换图，必须主动刷新，否则会重复提交同一张
                 self._refresh_captcha(self._get_captcha_dialog())
             except Exception:
@@ -350,6 +442,44 @@ class Copy(BaseStrategy):
             except Exception:
                 logger.debug("点击取消失败", exc_info=True)
         return False
+
+    def _wait_captcha_closed(self, timeout=2.0, interval=0.03):
+        """轮询等待验证码弹窗消失，返回是否已通过。
+
+        比固定 sleep 快得多：提交后通常几十毫秒就有结果，
+        而固定等待必须等到设定时间才能继续。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._get_captcha_dialog() is None:
+                return True
+            time.sleep(interval)
+        return False
+
+    def _wait_captcha_outcome(self, dialog, timeout=2.0, interval=0.03):
+        """等待验证码提交结果：passed / rejected / timeout。
+
+        客户端受理后弹窗直接关闭；被拒则弹窗保留并显示"验证码错误!!"。
+        尽早识别拒绝可以立刻换一张重试，省掉盲等超时的时间。
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._get_captcha_dialog() is None:
+                return "passed"
+            if self._captcha_error_shown(dialog):
+                return "rejected"
+            time.sleep(interval)
+        return "timeout"
+
+    def _captcha_error_shown(self, dialog):
+        """弹窗里是否已经显示出"验证码错误"提示。"""
+        try:
+            label = dialog.window(
+                control_id=self.CAPTCHA_ERROR_CONTROL_ID, class_name="Static"
+            )
+            return bool(label.exists(timeout=0)) and label.is_visible()
+        except Exception:
+            return False
 
     def _refresh_captcha(self, dialog):
         """点图片刷新验证码，并确认图片真的变了。
@@ -382,7 +512,7 @@ class Copy(BaseStrategy):
         """取验证码图片的指纹，用于判断是否已刷新。"""
         try:
             buffer = io.BytesIO()
-            image.capture_as_image().save(buffer, format="PNG")
+            self._capture_control(image).save(buffer, format="PNG")
             return hashlib.md5(buffer.getvalue()).hexdigest()
         except Exception:
             return ""
@@ -536,7 +666,7 @@ class Xls(BaseStrategy):
                 image_path = handle[1]
                 os.close(handle[0])
                 captcha = self._captcha_image(self._trader.app.top_window())
-                captcha.capture_as_image().save(image_path)
+                self._capture_control(captcha).save(image_path)
 
                 if self.captcha_config["save_debug_samples"]:
                     debug_dir = os.path.join(os.getcwd(), "captcha_debug")
