@@ -306,26 +306,40 @@ class Copy(BaseStrategy):
 
     def get(self, control_id: int) -> List[Dict]:
         grid = self._get_grid(control_id)
-        # 整个读取过程会短暂激活交易窗口（切菜单、复制、验证码弹窗），
-        # 结束后把前台还给用户原本的窗口，避免打断用户正在做的事。
+        # 整个读取过程会短暂激活交易窗口（复制触发验证码弹窗），
+        # 结束后尝试把前台还给用户原本的窗口。
         original_foreground = _foreground_window()
         try:
-            self._set_foreground(grid)
-            # 先清空剪贴板，否则复制失败时会读到上一次的旧数据
-            try:
-                pywinauto.clipboard.EmptyClipboard()
-            except Exception:
-                logger.debug("清空剪贴板失败", exc_info=True)
-
-            grid.set_focus()
-            # pause 会按"每个按键"累加等待：^A^C 共 5 个按键，
-            # pause=0.2 时仅这一步就要 1.2 秒，是整条链路最大的单点开销。
-            grid.type_keys("^A^C", set_foreground=False, pause=0.02)
-
-            content = self._get_clipboard_data()
+            content = self._copy_grid_to_clipboard(grid)
             return self._format_grid_data(content)
         finally:
             _restore_foreground(original_foreground)
+
+    def _copy_grid_to_clipboard(self, grid):
+        """把表格内容复制到剪贴板并读出文本。
+
+        用 WM_COMMAND 触发客户端的复制命令，而不是 set_focus + type_keys：
+        前者不需要把焦点交给表格控件，实测每次省约 0.3 秒，
+        且少一次焦点转移。触发后客户端会弹验证码，这一步无法避免。
+
+        必须发到控件句柄上——0xE122 是该表格控件的复制命令，
+        发给主窗口无效。
+        """
+        try:
+            pywinauto.clipboard.EmptyClipboard()
+        except Exception:
+            logger.debug("清空剪贴板失败", exc_info=True)
+
+        try:
+            grid.post_message(win32defines.WM_COMMAND, 0xE122, 0)
+        except Exception:
+            # 极少数环境下控件不接受消息，退回键盘复制
+            logger.debug("WM_COMMAND 复制失败，改用键盘复制", exc_info=True)
+            self._set_foreground(grid)
+            grid.set_focus()
+            grid.type_keys("^A^C", set_foreground=False, pause=0.02)
+
+        return self._get_clipboard_data()
 
     def _format_grid_data(self, data: str) -> List[Dict]:
         try:
@@ -481,11 +495,14 @@ class Copy(BaseStrategy):
         except Exception:
             return False
 
-    def _refresh_captcha(self, dialog):
+    def _refresh_captcha(self, dialog, timeout=1.0, interval=0.05):
         """点图片刷新验证码，并确认图片真的变了。
 
         被拒绝后客户端不会自动换图，如果刷新失败还继续提交，
         就会反复提交同一张验证码，白白耗尽重试次数。
+
+        用轮询代替固定 wait：换图通常几十毫秒就完成，
+        固定等待 0.4 秒会让每次重试多花掉一半时间。
         """
         if dialog is None:
             return False
@@ -493,14 +510,24 @@ class Copy(BaseStrategy):
             image = self._captcha_image(dialog)
             before = self._captcha_image_digest(image)
             image.click()
-            self._trader.wait(0.4)
-            after = self._captcha_image_digest(image)
-            if before and after and before == after:
-                # 再试一次，个别情况下第一次点击不生效
-                image.click()
-                self._trader.wait(0.4)
+            deadline = time.time() + timeout
+            changed = False
+            while time.time() < deadline:
                 after = self._captcha_image_digest(image)
-            changed = bool(before and after and before != after)
+                if before and after and before != after:
+                    changed = True
+                    break
+                time.sleep(interval)
+            if not changed:
+                # 个别情况下第一次点击不生效，再点一次
+                image.click()
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    after = self._captcha_image_digest(image)
+                    if before and after and before != after:
+                        changed = True
+                        break
+                    time.sleep(interval)
             if not changed:
                 logger.warning("刷新验证码后图片未变化")
             return changed
