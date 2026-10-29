@@ -1,6 +1,6 @@
 # Frytrader 安装指南
 
-Frytrader 是 EasyTrader 的 fork，Python 导入名仍为 `easytrader`。请从本仓库安装，不要把 PyPI 原版与此 fork 混装。
+Frytrader 是 EasyTrader 的 fork。发行包名为 `frytrader`，Python 导入名仍为 `easytrader`，因此已有代码无需修改。**不要同时安装 PyPI 上游的 `easytrader`**，两者会争用同一导入名。
 
 ## 系统要求
 
@@ -10,7 +10,17 @@ Frytrader 是 EasyTrader 的 fork，Python 导入名仍为 `easytrader`。请从
 
 ## 安装
 
+从 PyPI 安装稳定版：
+
 ```powershell
+python -m pip install frytrader
+```
+
+从仓库安装开发版：
+
+```powershell
+git clone https://github.com/Fryt1/Frytrader.git
+cd Frytrader
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -18,6 +28,8 @@ python -m pip install -e .
 ```
 
 验证码识别需要单独安装 Tesseract OCR，并确保 `tesseract.exe` 在 `PATH` 中，或在 `config.json` 的 `captcha.tesseract_path` 指定路径。
+
+后台只读模式还需要 AutoHotkey v2，可通过 `python -m pip install -e ".[background]"` 安装 Python 依赖后再单独安装 AHK。程序不会在运行时自动下载或安装软件。
 
 ## 配置
 
@@ -29,10 +41,14 @@ MiniQMT 的 Python 依赖可通过 `python -m pip install -e ".[miniqmt]"` 安�
 
 ## 测试
 
-可以运行离线单元测试：
+可以运行全部离线测试：
 
 ```powershell
-python -m unittest tests.test_xqtrader
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
 `tests/test_easytrader.py` 包含环境变量启用的券商客户端集成测试，可能连接真实账户；没有明确配置隔离测试账户时不要启用。
+
+## 发布新版本
+
+见 [`docs/publishing.md`](docs/publishing.md)。

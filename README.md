@@ -144,6 +144,8 @@ $ python -m unittest discover -s tests -p "test_*.py"
 
 `tests/test_easytrader.py` 中的集成测试受 `EZ_TEST_CLIENTS` 环境变量控制，会连接真实账户。没有隔离测试账户时不要启用。不要把真实委托作为 CI 测试。
 
+发布新版本见 [`docs/publishing.md`](docs/publishing.md)。
+
 ## 维护者
 
 [Fryt1](https://github.com/Fryt1)。问题请提交到 [Issues](https://github.com/Fryt1/Frytrader/issues)。
