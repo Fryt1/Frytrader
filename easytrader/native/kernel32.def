@@ -1,0 +1,18 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetEnvironmentVariableW@12
+CreateFileW@28
+ReadFile@20
+WriteFile@20
+CloseHandle@4
+lstrlenW@4
+lstrcpyW@8
+lstrcatW@8
+ExitProcess@4
+LoadLibraryW@4
+GetProcAddress@8
+FreeLibrary@4
+Sleep@4
+GetFileAttributesW@4
+OpenProcess@12
+WaitForSingleObject@8

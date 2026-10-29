@@ -1,0 +1,9 @@
+LIBRARY user32.dll
+EXPORTS
+CallNextHookEx@16
+GetWindowThreadProcessId@8
+SetWindowsHookExW@16
+UnhookWindowsHookEx@4
+PeekMessageW@20
+TranslateMessage@4
+DispatchMessageW@4

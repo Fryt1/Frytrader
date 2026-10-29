@@ -41,12 +41,21 @@ setup(
         "urllib3>=1.26.0",
         "werkzeug>=1.0.0",
     ],
-    extras_require={"miniqmt": ["xtquant"]},
+    extras_require={
+        "miniqmt": ["xtquant"],
+        "background": ["pyvda>=0.6.0,<0.7; sys_platform == 'win32'"],
+    },
     classifiers=[
         "Development Status :: 4 - Beta",
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
     ],
     packages=find_packages(include=["easytrader", "easytrader.*"]),
-    package_data={"easytrader": ["config/*.json"]},
+    package_data={
+        "easytrader": [
+            "config/*.json", "config/*.ahk", "native/*.c",
+            "native/*.def", "native/*.ps1", "native/bin/*.dll",
+            "native/bin/*.exe",
+        ]
+    },
 )

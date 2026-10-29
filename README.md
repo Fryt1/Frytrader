@@ -61,6 +61,8 @@ print(user.position)
 
 支持的客户端类型、登录方式和交易方法见 [`docs/usage.md`](docs/usage.md)。示例只查询账户；真实买卖操作需要明确指定账户、标的、价格和数量，并核对客户端回报。
 
+Windows 远航版支持任务视图后台只读模式：`easytrader.use("ths", background=True)`，在不抢键盘、鼠标和前台的前提下读取资金、持仓、委托与成交。已在本机登录态上连续两轮 8/8 读取成功、零桌面干扰；非空表格与长时间稳定性尚未验证。用法、限制与依赖见 [`docs/background.md`](docs/background.md)。此前的[底层独立桌面实验](docs/desktop_control.md)仍保留，未作为选定方案。
+
 ## 配置
 
 复制 [`config.json.example`](config.json.example) 为 `config.json`，填写账号、密码和客户端路径。`config.json` 已加入 `.gitignore`。

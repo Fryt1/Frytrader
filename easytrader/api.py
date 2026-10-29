@@ -28,6 +28,14 @@ def use(broker, debug=False, **kwargs):
         >>> user = easytrader.use('xq')
         >>> user.prepare('xq.json')
     """
+    if "background" in kwargs:
+        if not isinstance(kwargs["background"], bool):
+            raise TypeError("background 必须是布尔值")
+        if kwargs["background"] and broker.lower() not in (
+            "ths", "同花顺客户端"
+        ):
+            raise NotImplementedError("后台只读模式仅支持 ths 远航版")
+
     if debug:
         logger.setLevel(logging.DEBUG)
 
@@ -70,6 +78,13 @@ def use(broker, debug=False, **kwargs):
         return UniversalClientTrader()
 
     if broker.lower() in ["ths", "同花顺客户端"]:
+        background = kwargs.pop("background", False)
+        if not isinstance(background, bool):
+            raise TypeError("background 必须是布尔值")
+        if background:
+            from .background_trader import BackgroundThsTrader
+
+            return BackgroundThsTrader(**kwargs)
         from .clienttrader import ClientTrader
 
         return ClientTrader()
