@@ -167,6 +167,43 @@ class BackendTests(unittest.TestCase):
         self.desktops.remove.assert_not_called()
         self.assertIn("owned", self.ids)
 
+    def test_background_check_accepts_cloaked_windows_without_moving_them(
+        self,
+    ):
+        self.discover()
+        self.backend.enter_background()
+        self.desktops.move.reset_mock()
+        self.backend.assert_background()
+        self.desktops.move.assert_not_called()
+        self.native.set_visible_no_activate.assert_not_called()
+
+    def test_background_check_rejects_uncloaked_or_unknown_window(self):
+        self.discover()
+        self.backend.enter_background()
+        self.desktops.move.reset_mock()
+        for state in (0, None):
+            with self.subTest(cloaked=state):
+                self.native.cloaked.side_effect = None
+                self.native.cloaked.return_value = state
+                with self.assertRaisesRegex(RuntimeError, "未遮蔽"):
+                    self.backend.assert_background()
+        self.desktops.move.assert_not_called()
+        self.native.set_visible_no_activate.assert_not_called()
+
+    def test_background_check_rejects_current_target_desktop(self):
+        self.discover()
+        self.backend.enter_background()
+        self.desktops.current_id.return_value = "owned"
+        with self.assertRaisesRegex(RuntimeError, "当前桌面"):
+            self.backend.assert_background()
+
+    def test_background_check_rejects_external_window_move(self):
+        self.discover()
+        self.backend.enter_background()
+        self.location[1] = "work"
+        with self.assertRaisesRegex(RuntimeError, "离开"):
+            self.backend.assert_background()
+
     def test_grid_copy_rejects_foreign_pid(self):
         self.discover()
         self.nodes[4]["pid"] = 99

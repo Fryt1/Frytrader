@@ -49,7 +49,12 @@ class FakeBackend:
         self.restore_calls = 0
         self.protection_started = False
         self.protection_ended = False
+        self.window_exposed = False
         self.pages = []
+
+    def assert_background(self):
+        if self.window_exposed:
+            raise RuntimeError("visible uncloaked window")
 
     def ensure_render_ready(self):
         if not self.protection_started:
@@ -254,6 +259,40 @@ class InterferenceTests(unittest.TestCase):
         with self.assertRaises(BackgroundInterference):
             self.guard.check()
 
+    def test_transient_desktop_switch_stays_failed_after_switching_back(self):
+        self.backend.desktop = "trader desktop"
+        with self.assertRaises(BackgroundInterference) as first:
+            self.guard.sample()
+        self.backend.desktop = "work"
+        for _ in range(3):
+            with self.assertRaises(BackgroundInterference) as later:
+                self.guard.check()
+            self.assertIs(later.exception, first.exception)
+
+    def test_exposed_window_is_failure_even_when_foreground_did_not_change(
+        self,
+    ):
+        self.backend.window_exposed = True
+        with self.assertRaisesRegex(BackgroundInterference, "uncloaked"):
+            self.guard.check()
+        self.assertEqual(self.backend.foreground, 99)
+        self.backend.window_exposed = False
+        with self.assertRaises(BackgroundInterference):
+            self.guard.check()
+
+    def test_next_step_is_not_executed_after_observed_interference(self):
+        actions = []
+        self.guard.check()
+        actions.append("first field")
+        self.backend.foreground = self.backend.trader_pid
+        with self.assertRaises(BackgroundInterference):
+            self.guard.sample()
+        self.backend.foreground = 99
+        with self.assertRaises(BackgroundInterference):
+            self.guard.check()
+            actions.append("second field")
+        self.assertEqual(actions, ["first field"])
+
     def test_stale_window_identity_aborts(self):
         self.backend.valid = False
         with self.assertRaisesRegex(BackgroundError, "窗口"):
@@ -290,6 +329,39 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(engine.last_report["captcha_attempts"], 1)
         self.assertEqual(runtime.calls, [("fill", "Abc1"), ("click", "ok")])
+
+    def test_interference_during_fill_prevents_click_and_retry(self):
+        backend = FakeBackend()
+        runtime = FakeRuntime(backend)
+        focus = mock.Mock()
+        engine = _Engine(
+            BackgroundOptions(page_settle=0), backend, runtime, focus
+        )
+        engine.connected = True
+
+        def steal_foreground(*_):
+            backend.foreground = backend.trader_pid
+
+        runtime.fill = mock.Mock(side_effect=steal_foreground)
+        runtime.click = mock.Mock()
+        with mock.patch(
+            "easytrader.background_trader.query_lease", lambda _: nullcontext()
+        ), mock.patch.object(
+            QueryGuard, "start", lambda guard: guard.check()
+        ), mock.patch(
+            "easytrader.background_trader.captcha_recognize_improved",
+            return_value="Abc1",
+        ):
+            with self.assertRaises(BackgroundInterference):
+                engine.query(
+                    "today_entrusts", time.monotonic() + 5, threading.Event()
+                )
+        runtime.fill.assert_called_once()
+        runtime.click.assert_not_called()
+        self.assertTrue(backend.protection_ended)
+        focus.close.assert_called_once()
+        self.assertFalse(engine.last_report["ok"])
+        self.assertEqual(backend.restore_calls, 0)
 
     def test_rejection_refreshes_before_next_attempt(self):
         backend = FakeBackend()

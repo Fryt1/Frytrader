@@ -1051,6 +1051,36 @@ class WindowsBackend:
             raise RuntimeError("下单窗口线程身份已改变")
         return self.trader_hwnd, self.trader_pid, thread
 
+    def assert_background(self):
+        """Read-only check; never try to fix placement after interference."""
+        if not self.identity_ok() or self._target_desktop_id is None:
+            raise RuntimeError("后台会话或窗口身份已失效")
+        desktops = self._desktops()
+        if desktops.current_id() == self._target_desktop_id:
+            raise RuntimeError("客户端桌面已成为当前桌面")
+        if (
+            desktops.view_desktop_id(self.owner_hwnd)
+            != self._target_desktop_id
+        ):
+            raise RuntimeError("远航版已离开后台桌面")
+        native = self._native()
+        pids = {self.owner_pid, self.trader_pid}
+        for hwnd in native.enumerate_top():
+            try:
+                if native.process_id(hwnd) not in pids:
+                    continue
+                if not native.is_visible(hwnd):
+                    continue
+                cloaked = native.cloaked(hwnd)
+            except Exception:
+                if native.is_window(hwnd):
+                    raise RuntimeError("无法确认客户端窗口是否被遮蔽")
+                continue
+            if not cloaked:
+                raise RuntimeError(
+                    "客户端有可见且未遮蔽的窗口，后台操作已停止"
+                )
+
     def ensure_render_ready(self):
         """Show only the cloaked trader, with NOACTIVATE + CBT active."""
         native = self._native()

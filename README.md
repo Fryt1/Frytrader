@@ -109,6 +109,8 @@ finally:
 
 **尚未验证**：非空持仓/委托/成交数据、长时间无人值守稳定性、非 x86 客户端、非 Windows 平台。
 
+**后台模式不支持交易**。买入、卖出、撤单、打新和逆回购需改用前台模式 `easytrader.use("ths")`，因为同花顺交易表单在写入时会取得前台焦点，这是客户端行为。详见 [为什么后台模式不支持下单](docs/background.md#为什么后台模式不支持下单)。
+
 ## API
 
 入口为 `easytrader.use(broker)`。账户对象提供 `balance`、`position`、`today_entrusts`、`today_trades` 等查询属性，以及上游定义的 `buy`、`sell`、撤单等方法。

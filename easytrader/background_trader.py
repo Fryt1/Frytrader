@@ -79,17 +79,37 @@ class QueryGuard:
         self.last_sample = time.monotonic()
         self.thread = None
         self.activation_guard = None
+        self._problem_lock = threading.Lock()
+
+    def _latch(self, problem):
+        with self._problem_lock:
+            if self.problem is None:
+                self.problem = problem
+            return self.problem
 
     def sample(self):
-        if self.backend.current_desktop_id() != self.source:
-            raise BackgroundInterference(
-                "检测到任务视图桌面变化，后台读取已停止"
+        if self.problem is not None:
+            raise self.problem
+        try:
+            if self.backend.current_desktop_id() != self.source:
+                raise BackgroundInterference(
+                    "检测到任务视图桌面变化，后台操作已停止"
+                )
+            if self.backend.foreground_pid() in (
+                self.backend.owner_pid,
+                self.backend.trader_pid,
+            ):
+                raise BackgroundInterference(
+                    "远航版激活了前台，后台操作已停止"
+                )
+            self.backend.assert_background()
+        except Exception as exc:
+            problem = (
+                exc
+                if isinstance(exc, BackgroundInterference)
+                else BackgroundInterference(str(exc))
             )
-        if self.backend.foreground_pid() in (
-            self.backend.owner_pid,
-            self.backend.trader_pid,
-        ):
-            raise BackgroundInterference("远航版激活了前台，后台读取已停止")
+            raise self._latch(problem)
         self.last_sample = time.monotonic()
 
     def check(self):
@@ -119,7 +139,7 @@ class QueryGuard:
                     try:
                         self.sample()
                     except Exception as exc:
-                        self.problem = BackgroundInterference(str(exc))
+                        self._latch(BackgroundInterference(str(exc)))
                     finally:
                         self.ready.set()
                     if self.problem or self.stopping.wait(0.02):
