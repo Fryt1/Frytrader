@@ -107,12 +107,21 @@ class TestRequireEntrustResult(unittest.TestCase):
         with self.assertRaises(exceptions.TradeError):
             MinimalTrader._require_entrust_result({"message": "success"})
 
-    def test_trade_raises_when_no_entrust_no(self):
+    def test_trade_aborts_when_foreground_channel_unavailable(self):
+        """下单走前台通道：拿不到通道时必须在提交前中止。
+
+        早先 trade() 直接调 _submit_trade；现在改为前台通道填表+提交，
+        通道不可用时绝不能退回到会被静默忽略的 WM_SETTEXT 路径，
+        更不能在没比对确认弹窗的情况下提交。
+        """
         trader = MinimalTrader()
         trader.is_exist_pop_dialog = lambda: False
+        trader._trade_channel = mock.Mock(
+            side_effect=exceptions.TradeError("前台通道不可用")
+        )
         with self.assertRaises(exceptions.TradeError):
             trader.trade("600000", 10.0, 100)
-        self.assertEqual(trader.submitted, 1)
+        self.assertEqual(trader.submitted, 0)
 
 
 class TestMarketTradeTypeFailure(unittest.TestCase):

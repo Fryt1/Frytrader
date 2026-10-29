@@ -176,59 +176,84 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def cancel_entrust(self, entrust_no):
+        """按委托编号撤单。
+
+        实盘踩到的坑：撤单页的表格列名与当日委托不同（撤单页没有"状态"
+        列而是分组标题），``_get_grid_data`` 读不到可见表格时会拿错，
+        结果明明挂着单也报"委托单状态错误不能撤单"。因此这里先真实刷新
+        列表，并在找不到目标时区分"确实没有该委托"和"表格没读到"。
+        """
         self.refresh()
-        for i, entrust in enumerate(self.cancel_entrusts):
-            if entrust[self._config.CANCEL_ENTRUST_ENTRUST_FIELD] == entrust_no:
-                self._cancel_entrust_by_double_click(i)
+        entrusts = self.cancel_entrusts
+
+        field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
+        columns, rows = self._frame_rows(entrusts, {field})
+        if field not in columns:
+            raise exceptions.TradeError(
+                "撤单页表格读取失败（缺少列 %s），未执行撤单" % field
+            )
+
+        for index, row in enumerate(rows):
+            if str(row.get(field, "")).strip() == str(entrust_no).strip():
+                self._cancel_entrust_by_double_click(index)
                 return self._handle_pop_dialogs()
         return {"message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"}
 
     def cancel_all_entrusts(self):
+        """全部撤单。
+
+        撤单页顶部有一个"全撤(Z /)"按钮（control_id 30001），点完会弹
+        「撤单确认」，必须点"是"才真正撤。原来的实现用 top_window 找按钮，
+        在远航版上会找到隐藏页面那一份，点了没反应。
+        """
         self.refresh()
         self._switch_left_menus(["撤单[F3]"])
 
-        # 点击全部撤销控件
-        self._app.top_window().child_window(
-            control_id=self._config.TRADE_CANCEL_ALL_ENTRUST_CONTROL_ID, class_name="Button", title_re="""全撤.*"""
-        ).click()
-        self.wait(0.2)
+        channel = self._trade_channel()
+        channel.ensure_visible()
+        channel.activate()
 
-        # 等待出现 确认兑换框
-        if self.is_exist_pop_dialog():
-            # 点击是 按钮
-            w = self._app.top_window()
-            if w is not None:
-                btn = w["是(Y)"]
-                if btn is not None:
-                    btn.click()
-                    self.wait(0.2)
+        button = channel.find(
+            self._config.TRADE_CANCEL_ALL_ENTRUST_CONTROL_ID, "Button"
+        )
+        if not button:
+            raise exceptions.TradeError("撤单页找不到“全撤”按钮，未执行撤单")
+        channel.post_click(button)
+        self.wait(0.5)
 
-        # 如果出现了确认窗口
-        self.close_pop_dialog()
+        dialog, title, _ = channel.wait_dialog(
+            ["撤单确认", "撤单提示"], timeout=5.0
+        )
+        if dialog:
+            channel.click_dialog(dialog, 6)  # 是(Y)
+            self.wait(0.4)
+            result, result_title, body = channel.wait_dialog(
+                ["提示", "提示信息"], timeout=5.0
+            )
+            if result:
+                channel._dismiss(result)
+            return {"message": body or title}
+        return {"message": "已点击全撤"}
 
     @perf_clock
     def repo(self, security, price, amount, **kwargs):
-        self._switch_left_menus(["债券回购", "融资回购（正回购）"])
-
-        return self.trade(security, price, amount)
+        return self.trade(
+            security, price, amount, menu_path=["债券回购", "融资回购（正回购）"]
+        )
 
     @perf_clock
     def reverse_repo(self, security, price, amount, **kwargs):
-        self._switch_left_menus(["债券回购", "融劵回购（逆回购）"])
-
-        return self.trade(security, price, amount)
+        return self.trade(
+            security, price, amount, menu_path=["债券回购", "融劵回购（逆回购）"]
+        )
 
     @perf_clock
     def buy(self, security, price, amount, **kwargs):
-        self._switch_left_menus(["买入[F1]"])
-
-        return self.trade(security, price, amount)
+        return self.trade(security, price, amount, menu_path=["买入[F1]"])
 
     @perf_clock
     def sell(self, security, price, amount, **kwargs):
-        self._switch_left_menus(["卖出[F2]"])
-
-        return self.trade(security, price, amount)
+        return self.trade(security, price, amount, menu_path=["卖出[F2]"])
 
     @perf_clock
     def market_buy(self, security, amount, ttype=None, limit_price=None, **kwargs):
@@ -427,16 +452,203 @@ class ClientTrader(IClientTrader):
             if window.window_text() != self._config.TITLE:
                 window.close()
 
-    def trade(self, security, price, amount):
+    def trade(self, security, price, amount, menu_path=None):
+        """限价委托。字段填写与提交都在前台通道里完成并逐项校验。"""
+        return self._trade_via_foreground(
+            security, price, amount, menu_path=menu_path
+        )
+
+    def _trade_via_foreground(
+        self, security, price, amount, expect_price=None, menu_path=None
+    ):
+        """前台下单主流程：填表 → 提交 → 比对确认弹窗 → 确认或取消。
+
+        关键点是**校验放在确认弹窗上**：交易表单的字段读不回来，但客户端
+        会在确认弹窗里用可读文本列出它真正准备提交的代码、价格、数量。
+        只有三项都与请求一致时才点“是”，否则一律点“否”并报错。
+        """
+        channel = self._trade_channel()
+        channel.ensure_visible()
+        if not channel.activate():
+            raise exceptions.TradeError(
+                "无法把下单窗口切到前台，键入会落到别的程序上，已中止"
+            )
+
+        code = str(security)[-6:]
+
+        # 必须先切到交易页再取"已有委托快照"：确认弹窗开着的时候去切页
+        # 会把本次委托连同弹窗一起弄丢；而快照又必须在提交前拿到。
+        if menu_path:
+            channel.select_page(menu_path)
+        known = self._entrust_numbers()
+        if menu_path:
+            channel.select_page(menu_path)
+
         self._set_trade_params(security, price, amount)
 
-        self._submit_trade()
+        # 代码是否真被客户端接受：证券简称由客户端自己查出来
+        name = channel.wait_stock_name()
+        logger.debug("证券代码 %s 已被客户端接受，简称 %s", code, name)
 
-        return self._require_entrust_result(
-            self._handle_pop_dialogs(
-                handler_class=pop_dialog_handler.TradePopDialogHandler
-            )
+        # 前台激活+键入会触发客户端的验证码拦截。验证码必须在下单前解决，
+        # 否则提交后弹出来的是验证码框而不是委托确认。
+        self._solve_captcha_if_any()
+
+        dialog, snapshot = channel.submit()
+        wanted_price = (
+            expect_price
+            if expect_price is not None
+            else easyutils.round_price_by_code(price, code)
         )
+        try:
+            self._verify_snapshot(snapshot, code, wanted_price, int(amount))
+        except exceptions.TradeError:
+            channel.reject(dialog)
+            raise
+
+        result = channel.confirm(dialog)
+        if result.get("entrust_no"):
+            return result
+        # 结果提示框的正文是自绘的，读不到编号；改为回查委托列表
+        return self._await_new_entrust(code, int(amount), known)
+
+    def _solve_captcha_if_any(self):
+        """前台交易期间若弹出验证码，先用既有识别流程通过它。
+
+        远航版在交易窗口被激活并接受键盘输入后会弹验证码，这是它的
+        防自动化措施。验证码不解决，点“买入”后弹出来的是验证码框，
+        委托根本发不出去。识别失败时明确抛错，绝不带着未通过的验证码
+        继续提交。
+        """
+        strategy = self.grid_strategy_instance
+        if not hasattr(strategy, "_get_captcha_dialog"):
+            return False
+        try:
+            dialog = strategy._get_captcha_dialog()
+        except Exception:
+            return False
+        if dialog is None:
+            return False
+        logger.info("检测到验证码弹窗，正在处理")
+        if not strategy._solve_captcha():
+            raise exceptions.TradeError(
+                "验证码未通过，已中止委托（未提交任何委托）"
+            )
+        return True
+
+    @staticmethod
+    def _frame_rows(frame, required=None):
+        """把表格结果统一成 (列名集合, 行字典列表)。
+
+        ``today_entrusts`` 等接口在本机实测返回的是 ``list[dict]``
+        而不是 DataFrame，早先按 DataFrame 写的判断会直接抛
+        ``AttributeError: 'list' object has no attribute 'columns'``。
+        """
+        if frame is None:
+            return set(), []
+        if hasattr(frame, "to_dict") and hasattr(frame, "columns"):
+            columns = {str(c) for c in frame.columns}
+            if required and not required.issubset(columns):
+                return columns, []
+            return columns, frame.to_dict("records")
+        if isinstance(frame, list):
+            columns = set()
+            rows = []
+            for item in frame:
+                if isinstance(item, dict):
+                    columns.update(str(k) for k in item)
+                    rows.append(item)
+            if required and not required.issubset(columns):
+                return columns, []
+            return columns, rows
+        return set(), []
+
+    def _entrust_numbers(self):
+        """当前委托列表里的合同编号集合，用于判断新增委托。"""
+        field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
+        try:
+            frame = self.today_entrusts
+        except Exception:
+            return set()
+        _, rows = self._frame_rows(frame, {field})
+        return {
+            str(row.get(field, "")).strip()
+            for row in rows
+            if str(row.get(field, "")).strip()
+        }
+
+    def _await_new_entrust(self, code, amount, known, timeout=25.0):
+        """确认后回查委托列表，找出本次新增的那笔委托。
+
+        同花顺的结果提示框正文是自绘的，``dialog_body`` 读不到合同编号，
+        所以委托编号只能从委托列表里反查。只有"新出现的、代码与数量都
+        对得上"的委托才算本次结果，找不到就明确报未知。
+
+        注意：读表格本身会触发验证码，这里每轮都先处理掉验证码再读。
+        """
+        field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
+        deadline = time.monotonic() + timeout
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                self._solve_captcha_if_any()
+                frame = self.today_entrusts
+            except exceptions.TradeError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.5)
+                continue
+            columns, rows = self._frame_rows(frame, {field})
+            if field not in columns:
+                last_error = "委托列表缺少 %s 列（当前列：%s）" % (
+                    field,
+                    ",".join(sorted(columns)) or "无",
+                )
+                time.sleep(0.5)
+                continue
+            for row in rows:
+                number = str(row.get(field, "")).strip()
+                if not number or number in known:
+                    continue
+                row_code = str(row.get("证券代码", "")).strip()
+                if row_code and row_code != code:
+                    continue
+                row_amount = str(row.get("委托数量", "")).strip()
+                if row_amount and int(float(row_amount)) != amount:
+                    continue
+                return {
+                    "entrust_no": number,
+                    "security": code,
+                    "amount": amount,
+                    "status": str(row.get("备注", "")).strip(),
+                    "source": "委托列表回查",
+                }
+            time.sleep(0.5)
+        raise exceptions.TradeError(
+            "确认后未能在委托列表中找到本次委托，结果未知，请人工核对。"
+            "{}".format("查询错误: %s" % last_error if last_error else "")
+        )
+
+    @staticmethod
+    def _verify_snapshot(snapshot, code, price, amount):
+        """确认弹窗里的内容必须与请求完全一致，否则不许提交。"""
+        problems = []
+        if snapshot.security != code:
+            problems.append("证券代码 期望 %s 实际 %s" % (code, snapshot.security))
+        if snapshot.amount is None or int(snapshot.amount) != int(amount):
+            problems.append("委托数量 期望 %s 实际 %s" % (amount, snapshot.amount))
+        try:
+            actual_price = float(snapshot.price) if snapshot.price else None
+        except (TypeError, ValueError):
+            actual_price = None
+        if actual_price is None or abs(actual_price - float(price)) > 1e-6:
+            problems.append("委托价格 期望 %s 实际 %s" % (price, snapshot.price))
+        if problems:
+            raise exceptions.TradeError(
+                "确认弹窗内容与请求不一致，已取消委托：%s" % "；".join(problems)
+            )
+        return True
 
     @staticmethod
     def _require_entrust_result(result):
@@ -479,19 +691,18 @@ class ClientTrader(IClientTrader):
         )
 
     def _set_trade_params(self, security, price, amount):
-        code = security[-6:]
+        code = str(security)[-6:]
+
+        # 先清成空表单，避免上一笔的残留值被带进来
+        self._trade_channel().refill()
 
         self._type_edit_control_keys(self._config.TRADE_SECURITY_CONTROL_ID, code)
 
-        # wait security input finish
-        self.wait(0.1)
-
         # 设置交易所
-        if security.lower().startswith("sz"):
+        if str(security).lower().startswith("sz"):
             self._set_stock_exchange_type("深圳Ａ股")
-        if security.lower().startswith("sh"):
+        if str(security).lower().startswith("sh"):
             self._set_stock_exchange_type("上海Ａ股")
-        self.wait(0.1)
 
         self._type_edit_control_keys(
             self._config.TRADE_PRICE_CONTROL_ID,
@@ -526,14 +737,33 @@ class ClientTrader(IClientTrader):
         )
 
     def _type_edit_control_keys(self, control_id, text):
-        if not self._editor_need_type_keys:
-            self._main.child_window(
-                control_id=control_id, class_name="Edit"
-            ).set_edit_text(text)
-        else:
-            editor = self._main.child_window(control_id=control_id, class_name="Edit")
-            editor.select()
-            editor.type_keys(text)
+        """写入交易字段。
+
+        远航版的交易表单只认真实键盘输入：``set_edit_text``（底层
+        ``WM_SETTEXT``）会被静默忽略；而三个 Edit 的文本**读不回来**
+        （``WM_GETTEXT`` / ``EM_GETLINE`` / UIA ValuePattern 全部返回空，
+        文本由客户端自绘）。所以这里既不能用 ``set_edit_text``，也不能做
+        写入后回读比对——真正的校验落在下单确认弹窗上，见
+        ``_trade_via_foreground``。
+        """
+        self._trade_channel().type_field(control_id, text)
+
+    def _trade_channel(self):
+        """惰性建立前台交易通道。"""
+        if getattr(self, "_channel", None) is None:
+            from easytrader.foreground_trade import ForegroundTradeChannel
+
+            self._channel = ForegroundTradeChannel(
+                self._main.wrapper_object().handle,
+                tree_hwnd=self._find_tree_hwnd(),
+            )
+        return self._channel
+
+    def _find_tree_hwnd(self):
+        try:
+            return int(self._get_left_menus_handle().wrapper_object().handle)
+        except Exception:
+            return None
 
     def type_edit_control_keys(self, editor, text):
         if not self._editor_need_type_keys:
