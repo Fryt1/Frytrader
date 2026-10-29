@@ -2,16 +2,21 @@ from setuptools import find_packages, setup
 
 
 setup(
-    name="easytrader",
-    version="0.24.0",
-    description="低频 GUI 交易适配器，增强验证码识别与表格导出。",
+    name="frytrader",
+    version="0.1.0",
+    description="中国券商 GUI 交易适配器，支持同花顺远航版后台只读模式。",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
     author="Fryt1",
     license="MIT",
     url="https://github.com/Fryt1/Frytrader",
-    keywords="China stock trade",
+    keywords="china stock trade, easytrader, ths, 同花顺",
     python_requires=">=3.8",
+    project_urls={
+        "Source": "https://github.com/Fryt1/Frytrader",
+        "Tracker": "https://github.com/Fryt1/Frytrader/issues",
+        "Upstream": "https://github.com/shidenggui/easytrader",
+    },
     install_requires=[
         "requests>=2.25.0",
         "six>=1.15.0",
@@ -47,8 +52,12 @@ setup(
     },
     classifiers=[
         "Development Status :: 4 - Beta",
-        "Programming Language :: Python :: 3",
+        "Environment :: Win32 (MS Windows)",
+        "Intended Audience :: Financial and Insurance Industry",
         "License :: OSI Approved :: MIT License",
+        "Operating System :: Microsoft :: Windows",
+        "Programming Language :: Python :: 3",
+        "Topic :: Office/Business :: Financial :: Investment",
     ],
     packages=find_packages(include=["easytrader", "easytrader.*"]),
     package_data={
