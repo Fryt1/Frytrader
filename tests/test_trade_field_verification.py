@@ -14,7 +14,11 @@ import unittest
 
 from easytrader import exceptions
 from easytrader.clienttrader import ClientTrader
-from easytrader.foreground_trade import ConfirmSnapshot, _clean
+from easytrader.foreground_trade import (
+    ConfirmSnapshot,
+    ForegroundTradeChannel,
+    _clean,
+)
 
 
 CONFIRM_BODY = (
@@ -149,6 +153,120 @@ class FieldWriteRoutingTests(unittest.TestCase):
         trader._type_edit_control_keys(1032, "000001")
 
         self.assertEqual(channel.calls, [(1032, "000001")])
+
+
+class EntrustNoExtractionTests(unittest.TestCase):
+    """委托编号必须解析成**纯数字**，且不得从任意正文里捞数字。
+
+    早先 ``confirm`` 用 ``match.group(0)``，返回值是“合同编号：123456”，
+    上层再拿它去和委托列表的编号比对永远不相等，撤单必然失败。
+    """
+
+    def test_returns_bare_numeric_id(self):
+        self.assertEqual(
+            ForegroundTradeChannel._extract_entrust_no("委托成功，合同编号：123456"),
+            "123456",
+        )
+
+    def test_short_three_digit_id_is_accepted(self):
+        """合同编号不保证 4 位以上，3 位也要认。"""
+        self.assertEqual(
+            ForegroundTradeChannel._extract_entrust_no("合同编号:123"), "123"
+        )
+
+    def test_does_not_infer_from_arbitrary_digits(self):
+        """正文里有价格/金额但没有编号字段时，绝不能抓一段数字当编号。"""
+        for body in (
+            "委托成功，成交金额 1234.56 元",
+            "买入 000001 价格 10.39 数量 100",
+            "资金余额 123456",
+        ):
+            with self.subTest(body=body):
+                self.assertIsNone(
+                    ForegroundTradeChannel._extract_entrust_no(body)
+                )
+
+    def test_empty_text_yields_none(self):
+        self.assertIsNone(ForegroundTradeChannel._extract_entrust_no(""))
+
+
+class DirectionVerificationTests(unittest.TestCase):
+    """声明了方向就必须在弹窗里得到证明，读不到方向同样算校验失败。"""
+
+    BUY_BODY = _clean(
+        "证券代码：000001(平安银行)\n"
+        "买入价格：10.390\n"
+        "买入数量：100\n"
+        "\n您是否确定以上买入委托？"
+    )
+
+    def test_direction_parsed_from_real_wording(self):
+        snapshot = ConfirmSnapshot(self.BUY_BODY)
+        self.assertEqual(snapshot.direction, "买入")
+
+    def test_matching_direction_passes(self):
+        snapshot = ConfirmSnapshot(self.BUY_BODY)
+        self.assertTrue(ClientTrader._verify_snapshot_direction(snapshot, "买入"))
+
+    def test_mismatched_direction_aborts(self):
+        snapshot = ConfirmSnapshot(self.BUY_BODY)
+        with self.assertRaises(exceptions.TradeError) as caught:
+            ClientTrader._verify_snapshot_direction(snapshot, "卖出")
+        self.assertIn("方向", str(caught.exception))
+
+    def test_unreadable_direction_aborts_when_declared(self):
+        """弹窗读不出方向时不能放行——无法证明的委托不许提交。"""
+        snapshot = ConfirmSnapshot(_clean("证券代码：000001\n买入价格：10.390\n"))
+        self.assertIsNone(snapshot.direction)
+        with self.assertRaises(exceptions.TradeError):
+            ClientTrader._verify_snapshot_direction(snapshot, "买入")
+
+    def test_no_declared_direction_skips_check(self):
+        snapshot = ConfirmSnapshot(self.BUY_BODY)
+        self.assertTrue(ClientTrader._verify_snapshot_direction(snapshot, None))
+
+
+class RepoSnapshotTests(unittest.TestCase):
+    """回购页确认弹窗用「融资/融券」措辞，不能因此解析成空而误中止。"""
+
+    def test_repo_labels_are_parsed(self):
+        snapshot = ConfirmSnapshot(_clean(
+            "证券代码：204001(GC001)\n"
+            "融资价格：2.005\n"
+            "融资数量：10\n"
+        ))
+        self.assertEqual(snapshot.price, "2.005")
+        self.assertEqual(snapshot.amount, "10")
+
+    def test_reverse_repo_labels_are_parsed(self):
+        snapshot = ConfirmSnapshot(_clean(
+            "证券代码：204001(GC001)\n"
+            "融券价格：2.005\n"
+            "融券数量：10\n"
+        ))
+        self.assertEqual(snapshot.price, "2.005")
+        self.assertEqual(snapshot.amount, "10")
+
+
+class MenuPathTests(unittest.TestCase):
+    """回购菜单文案必须与客户端完全一致，否则会走模糊匹配挑错方向。"""
+
+    def test_repo_paths_use_correct_character(self):
+        from easytrader.config import client as client_config
+
+        config = client_config.create("ths")
+        self.assertEqual(config.REPO_MENU_PATH, ["债券回购", "融资回购（正回购）"])
+        self.assertEqual(
+            config.REVERSE_REPO_MENU_PATH, ["债券回购", "融券回购（逆回购）"]
+        )
+
+    def test_reverse_repo_path_has_no_wrong_variant_character(self):
+        from easytrader.config import client as client_config
+
+        config = client_config.create("ths")
+        # 劵 是 券 的错字；写错后旧代码靠模糊匹配碰巧选中，极不可靠
+        for label in config.REVERSE_REPO_MENU_PATH:
+            self.assertNotIn("劵", label)
 
 
 if __name__ == "__main__":

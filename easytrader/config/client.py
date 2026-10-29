@@ -48,6 +48,12 @@ class CommonConfig:
     TODAY_ENTRUSTS_MENU_PATH = ["查询[F4]", "当日委托"]
     TODAY_TRADES_MENU_PATH = ["查询[F4]", "当日成交"]
 
+    # 债券回购页路径。这里的每个字都必须和客户端左侧菜单**完全一致**：
+    # 早先“融券”被误写成“融劵”，只因菜单查找走模糊匹配才碰巧选中正确项，
+    # 一旦客户端改字或模糊匹配挑错，正/逆回购就会互换（真金白银的方向错误）。
+    REPO_MENU_PATH = ["债券回购", "融资回购（正回购）"]
+    REVERSE_REPO_MENU_PATH = ["债券回购", "融券回购（逆回购）"]
+
     BALANCE_CONTROL_ID_GROUP = {
         "资金余额": 1012,
         "可用金额": 1016,

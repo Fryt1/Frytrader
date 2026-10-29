@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Type, Union
 
 import hashlib, binascii
@@ -182,45 +183,108 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def cancel_entrust(self, entrust_no):
-        """按委托编号撤单。
+        """按委托编号撤指定的**一笔**委托。
 
-        实测结论：撤单页的**双击行**在远航版上不可靠（点了不产生任何弹窗，
-        但调用返回得像成功一样，实际委托仍挂着）。真正有效的是顶部的
-        「撤单(Del)」/「全撤(Z /)」按钮 —— 点完会弹出标题为「提示信息」的
-        确认框，正文含"撤销这(N)笔委托"，点“是”才真正撤单。
+        安全约束（重要）：这里**绝不允许**退化成“全撤”。早先的实现为了绕过
+        “双击行不可靠”的问题，直接调用 ``cancel_all_entrusts()``，
+        结果是“撤一笔”实际撤掉了账户里所有挂单——这是资金损失级的缺陷。
+        离线回归见 tests/test_trade_result.py 的 CancelSingleOnlyTests。
 
-        因此这里：先确认真实存在可撤单，再点全撤并处理确认框，
-        最后用委托列表复核目标是否真的变成已撤，避免"报成功但没撤"。
+        现在只有一条路径：撤单页上精确定位目标行 → 只对目标行发起撤单
+        → 回查该行确实变成已撤。做不到精确定位时（找不到单笔撤单入口、
+        表格里没有这一行、或该客户端的单笔撤单方式尚未离线验证）
+        **在产生任何撤单副作用之前**抛 ``TradeError``，明确说明不支持。
         """
         field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
+        wanted = str(entrust_no).strip()
+        if not wanted:
+            raise exceptions.TradeError("未提供委托编号，未执行撤单")
+
         rows = self._frame_rows(self.cancel_entrusts, {field})[1]
-
         if not rows:
-            return {"message": "当前没有可撤委托单（该委托可能已成交或已撤）"}
-        numbers = {str(row.get(field, "")).strip() for row in rows}
-        if str(entrust_no).strip() not in numbers:
-            return {
-                "message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"
-            }
+            raise exceptions.TradeError(
+                "当前没有可撤委托单（该委托可能已成交或已撤），未执行撤单"
+            )
 
-        self.cancel_all_entrusts()
+        target_index = None
+        for index, row in enumerate(rows):
+            if str(row.get(field, "")).strip() == wanted:
+                target_index = index
+                break
+        if target_index is None:
+            raise exceptions.TradeError(
+                "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤，未执行撤单"
+            )
 
-        # 复核：目标必须真的变成已撤，否则如实报告而不是假装成功
-        try:
-            after = self.today_entrusts
-        except Exception:
-            after = None
-        if after is not None:
-            for row in self._frame_rows(after, {field})[1]:
-                if str(row.get(field, "")).strip() == str(entrust_no).strip():
-                    status = str(row.get("备注", "")).strip()
-                    if "已撤" in status:
-                        return {"entrust_no": entrust_no, "status": status}
-                    return {
-                        "message": "撤单指令已发出，但该委托状态为 %s，"
-                        "请人工核对" % (status or "未知")
-                    }
-        return {"entrust_no": entrust_no, "status": "已提交撤单请求"}
+        pending_before = sum(1 for row in rows if self._is_pending_row(row))
+        self._cancel_single_row(target_index, wanted)
+        return {
+            "entrust_no": wanted,
+            "status": self._verify_single_cancelled(wanted, pending_before),
+        }
+
+    def _cancel_single_row(self, row_index, entrust_no):
+        """只对撤单页的第 ``row_index`` 行发起撤单。
+
+        撤单页上确实存在“撤单(Del)”（control_id 1099）按钮和行选择控件，
+        但**针对单行的可靠操作路径尚未验证**：双击行实测不产生任何弹窗，
+        而“全撤”一旦误触会撤掉全部挂单。在验证通过之前这里失败关闭，
+        既不点“全撤”，也不“试一试”双击行。
+        """
+        raise exceptions.TradeError(
+            "单笔撤单在当前客户端上尚未验证可安全执行（针对单行的可靠操作路径未确认；"
+            "“全撤”会误撤其它委托，因此不使用）。为避免误撤，已拒绝执行；"
+            "委托 %s 仍挂在账户里，请人工在客户端撤单。" % entrust_no
+        )
+
+    # 这些状态表示委托仍是**活动挂单**，不能当作撤单成功返回。
+    _PENDING_ENTRUST_STATUS = ("未报", "已报", "部成", "部分成交", "待报", "正报")
+
+    def _is_pending_row(self, row):
+        """该行是否仍是活动挂单（未报/已报/部成等）。"""
+        status = str(row.get("备注", "")).strip()
+        if "已撤" in status:
+            return False
+        for bad in self._INVALID_ENTRUST_STATUS:
+            if bad in status:
+                return False
+        return True
+
+    def _verify_single_cancelled(self, entrust_no, expected_pending):
+        """回查单笔撤单结果，返回该委托的最终状态。
+
+        判定标准：
+        - 目标必须是**已撤**（未报/已报等活动状态不算成功）；
+        - 活动挂单数必须恰好减少 1。少得更多说明牵连了其它委托，
+          必须立刻报错——这正是“撤一笔变全撤”的可观测特征。
+
+        目前单笔撤单失败关闭，保留该实现是为了让后续验证有明确的完成判据。
+        """
+        field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
+        after_rows = self._frame_rows(self.today_entrusts, {field})[1]
+        after_pending = sum(1 for row in after_rows if self._is_pending_row(row))
+        if after_pending < expected_pending - 1:
+            raise exceptions.TradeError(
+                "撤单后活动挂单数异常减少（%s → %s），可能牵连了其它委托，"
+                "请立即人工核对" % (expected_pending, after_pending)
+            )
+        for row in after_rows:
+            if str(row.get(field, "")).strip() != str(entrust_no).strip():
+                continue
+            status = str(row.get("备注", "")).strip()
+            if "已撤" in status:
+                return status
+            for pending in self._PENDING_ENTRUST_STATUS:
+                if pending in status:
+                    raise exceptions.TradeError(
+                        "撤单指令已发出，但委托 %s 仍为“%s”，请人工核对"
+                        % (entrust_no, status)
+                    )
+            raise exceptions.TradeError(
+                "撤单后委托 %s 状态为“%s”，无法确认已撤，请人工核对"
+                % (entrust_no, status or "未知")
+            )
+        raise exceptions.TradeError("撤单后无法在委托列表中找到该委托，请人工核对")
 
     def cancel_all_entrusts(self):
         """全部撤单。
@@ -273,23 +337,37 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def repo(self, security, price, amount, **kwargs):
+        """正回购（融资）。页面：债券回购 / 融资回购（正回购）。"""
         return self.trade(
-            security, price, amount, menu_path=["债券回购", "融资回购（正回购）"]
+            security,
+            price,
+            amount,
+            menu_path=self.config.REPO_MENU_PATH,
+            direction="融资",
         )
 
     @perf_clock
     def reverse_repo(self, security, price, amount, **kwargs):
+        """逆回购（融券）。页面：债券回购 / 融券回购（逆回购）。"""
         return self.trade(
-            security, price, amount, menu_path=["债券回购", "融劵回购（逆回购）"]
+            security,
+            price,
+            amount,
+            menu_path=self.config.REVERSE_REPO_MENU_PATH,
+            direction="融券",
         )
 
     @perf_clock
     def buy(self, security, price, amount, **kwargs):
-        return self.trade(security, price, amount, menu_path=["买入[F1]"])
+        return self.trade(
+            security, price, amount, menu_path=["买入[F1]"], direction="买入"
+        )
 
     @perf_clock
     def sell(self, security, price, amount, **kwargs):
-        return self.trade(security, price, amount, menu_path=["卖出[F2]"])
+        return self.trade(
+            security, price, amount, menu_path=["卖出[F2]"], direction="卖出"
+        )
 
     @perf_clock
     def market_buy(self, security, amount, ttype=None, limit_price=None, **kwargs):
@@ -325,16 +403,28 @@ class ClientTrader(IClientTrader):
         return self.market_trade(security, amount, ttype, limit_price=limit_price)
 
     def market_trade(self, security, amount, ttype=None, limit_price=None, **kwargs):
-        """
-        市价交易
-        :param security: 六位证券代码
-        :param amount: 交易数量
-        :param ttype: 市价委托类型，默认客户端默认选择，
-                     深市可选 ['对手方最优价格', '本方最优价格', '即时成交剩余撤销', '最优五档即时成交剩余 '全额成交或撤销']
-                     沪市可选 ['最优五档成交剩余撤销', '最优五档成交剩余转限价']
+        """市价交易。
 
-        :return: {'entrust_no': '委托单号'}
+        **同花顺(ths)当前不支持下单**（失败关闭）：市价委托没有可比对的限价
+        字段，而本客户端的确认弹窗正文与结果提示框都不可靠解析
+        （见 foreground_trade 模块头），``TradePopDialogHandler`` 又只会
+        盲目按“是(Y)”提交。在没有离线可验证的比对方式前，ths 在**填写任何
+        字段、提交任何消息之前**就抛错，绝不产生“看似成功”的假象。
+
+        其他券商适配器保持原有实现不变（它们的确认弹窗可解析）。
         """
+        if self.broker_type == "ths":
+            raise exceptions.TradeError(
+                "市价委托（market_buy/market_sell）在同花顺客户端上尚无"
+                "可离线验证的确认比对方式，为避免无校验提交，已拒绝执行。"
+                "请改用 buy/sell 限价委托。"
+            )
+        return self._market_trade_original(
+            security, amount, ttype, limit_price=limit_price
+        )
+
+    def _market_trade_original(self, security, amount, ttype=None, limit_price=None):
+        """其他券商适配器的原有市价下单流程。"""
         code = security[-6:]
         self._type_edit_control_keys(self._config.TRADE_SECURITY_CONTROL_ID, code)
         if ttype is not None:
@@ -398,14 +488,23 @@ class ClientTrader(IClientTrader):
         raise TypeError("不支持对应的市场类型: {}".format(ttype))
 
     def auto_ipo(self):
+        """批量新股申购。
+
+        返回**确定**结果：要么明确说“没有可申购的新股”，要么返回
+        ``{"message": ..., "result": "unknown"}`` / 抛错，绝不把
+        “什么都没发生”当作成功返回 None。
+        """
         self._switch_left_menus(self._config.AUTO_IPO_MENU_PATH)
 
         stock_list = self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID)
 
         if len(stock_list) == 0:
             return {"message": "今日无新股"}
+
         invalid_list_idx = [
-            i for i, v in enumerate(stock_list) if v[self.config.AUTO_IPO_NUMBER] <= 0
+            i
+            for i, v in enumerate(stock_list)
+            if self._ipo_quantity(v) <= 0
         ]
 
         if len(stock_list) == len(invalid_list_idx):
@@ -421,7 +520,34 @@ class ClientTrader(IClientTrader):
         self._click(self._config.AUTO_IPO_BUTTON_CONTROL_ID)
         self.wait(0.1)
 
-        return self._handle_pop_dialogs()
+        result = self._handle_pop_dialogs()
+        if isinstance(result, dict):
+            return result
+        # 没弹窗/弹窗未收敛时，代码根本不知道有没有申购成功。
+        # 早先直接返回 None，调用方会误当成成功。
+        return {
+            "message": "申购指令已发出，但客户端未给出可读结果，请人工核对",
+            "result": "unknown",
+        }
+
+    @staticmethod
+    def _ipo_quantity(row):
+        """读取一行里的可申购数量。
+
+        表格经 ``na_filter=False`` 解析，空单元格是空字符串而不是 0，
+        早先直接 ``v[申购数量] <= 0`` 会在空串上抛 TypeError；
+        这里统一转成数字，无法解析的按 0（不可申购）处理。
+        """
+        raw = row.get("申购数量", row.get("可申购数量", 0))
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return raw
+        text = str(raw).strip().replace(",", "")
+        if not text:
+            return 0
+        try:
+            return float(text)
+        except ValueError:
+            return 0
 
     def _click_grid_by_row(self, row):
         x = self._config.COMMON_GRID_LEFT_MARGIN
@@ -488,20 +614,30 @@ class ClientTrader(IClientTrader):
             if window.window_text() != self._config.TITLE:
                 window.close()
 
-    def trade(self, security, price, amount, menu_path=None):
+    def trade(self, security, price, amount, menu_path=None, direction=None):
         """限价委托。字段填写与提交都在前台通道里完成并逐项校验。"""
         return self._trade_via_foreground(
-            security, price, amount, menu_path=menu_path
+            security, price, amount, menu_path=menu_path, direction=direction
         )
 
     def _trade_via_foreground(
-        self, security, price, amount, expect_price=None, menu_path=None
+        self,
+        security,
+        price,
+        amount,
+        expect_price=None,
+        menu_path=None,
+        direction=None,
     ):
         """前台下单主流程：填表 → 提交 → 比对确认弹窗 → 确认或取消。
 
         关键点是**校验放在确认弹窗上**：交易表单的字段读不回来，但客户端
         会在确认弹窗里用可读文本列出它真正准备提交的代码、价格、数量。
         只有三项都与请求一致时才点“是”，否则一律点“否”并报错。
+
+        ``direction`` 是调用方声明的方向（买入/卖出/融资/融券）。只有确认
+        弹窗里也能读出方向时才比对；读不出就跳过，绝不因为“当前在哪个页面”
+        就假定方向正确。
         """
         channel = self._trade_channel()
         channel.ensure_visible()
@@ -521,6 +657,14 @@ class ClientTrader(IClientTrader):
             # 读到的是买入页的表格——表现就是"缺少合同编号列"。
             self._current_menu_path = None
         known = self._entrust_numbers()
+        if known is None:
+            # 没有完整基线就无法判定哪一笔是本次新增的。
+            # 必须在填表/提交**之前**中止：宁可不下单，也不能靠猜测把
+            # 别人的委托当成本次结果（上层会拿错编号去撤单）。
+            raise exceptions.TradeError(
+                "提交前无法读取完整委托列表作为基线，无法确认本次委托结果，"
+                "已在下单前中止（未产生任何委托）"
+            )
         if menu_path:
             channel.select_page(menu_path)
             self._current_menu_path = None
@@ -543,6 +687,7 @@ class ClientTrader(IClientTrader):
         )
         try:
             self._verify_snapshot(snapshot, code, wanted_price, int(amount))
+            self._verify_snapshot_direction(snapshot, direction)
         except exceptions.TradeError:
             channel.reject(dialog)
             raise
@@ -558,6 +703,29 @@ class ClientTrader(IClientTrader):
         channel.dismiss_leftovers()
         self._current_menu_path = None
         return self._await_new_entrust(code, int(amount), known)
+
+    @staticmethod
+    def _verify_snapshot_direction(snapshot, direction):
+        """确认弹窗必须能证明方向，且与调用方声明的方向一致。
+
+        调用方声明了方向（buy/sell/repo/reverse_repo）时，弹窗里**读不到**
+        方向同样视为校验失败：无法证明的委托不允许提交，不能靠“当前在哪个
+        页面”去推断。只有调用方不声明方向时才跳过。
+        """
+        if not direction:
+            return True
+        actual = getattr(snapshot, "direction", None)
+        if actual is None:
+            raise exceptions.TradeError(
+                "确认弹窗未能读出委托方向，无法确认是%s，已取消委托"
+                % direction
+            )
+        if str(actual).strip() != str(direction).strip():
+            raise exceptions.TradeError(
+                "确认弹窗方向与请求不一致，已取消委托：期望 %s 实际 %s"
+                % (direction, actual)
+            )
+        return True
 
     def _solve_captcha_if_any(self):
         """前台交易期间若弹出验证码，先用既有识别流程通过它。
@@ -611,12 +779,12 @@ class ClientTrader(IClientTrader):
         return set(), []
 
     def _entrust_numbers(self):
-        """提交前的委托编号快照，用于识别"本次新增"的那一笔。
+        """提交前的委托编号基线，用于识别"本次新增"的那一笔。
 
-        注意这里**不能**在读取失败时静默返回空集：早先那样写，一次读取
-        失败就会让快照变成空，于是列表里所有历史委托都会被当成"新增"，
-        反而把别人的单子当成本次结果。读取不到就返回 None，由调用方
-        明确降级：宁可只按代码+数量+未报状态匹配，也不拿空快照硬比。
+        这里**不能**在读取失败时静默返回空集：早先那样写，一次读取
+        失败就会让基线变成空，于是列表里所有历史委托都会被当成"新增"，
+        反而把别人的单子当成本次结果。读不到就返回 ``None``，
+        调用方 ``_trade_via_foreground`` 会据此在提交前直接中止。
         """
         field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
         try:
@@ -633,22 +801,31 @@ class ClientTrader(IClientTrader):
         }
 
     def _await_new_entrust(self, code, amount, known, timeout=25.0):
-        """确认后回查委托列表，找出本次新增的那笔委托。
+        """确认后回查委托列表，找出本次新增的那一笔委托。
 
         同花顺的结果提示框正文是自绘的，``dialog_body`` 读不到合同编号，
         所以委托编号只能从委托列表里反查。
 
-        匹配规则按 ``known`` 是否可用分两种：
-        - 有快照：只认"新出现的编号"，最严格；
-        - 没快照（提交前那次读取失败）：退回按 代码 + 数量 + 未报 匹配，
-          并且要求候选中恰好只有一个，多个候选视为不确定，不做猜测。
+        ``known`` 必须是提交前的**完整**基线。``None`` 表示读不到基线，
+        此时无法判定哪一笔是本次新增的，直接报错——即使本方法被私有直接调用
+        也不会退化成“按代码+数量猜”。判定规则只有一个：候选必须满足
+        “编号不在基线里 + 代码相同 + 数量精确相同 + 状态不是废单/失败/已撤”，
+        且**恰好只有一个**。多于一个候选就继续等，等不到就报结果未知——
+        绝不返回 ``matches[0]`` 去赌哪一笔是本次的。
         """
+        if known is None:
+            raise exceptions.TradeError(
+                "缺少提交前的委托编号基线，无法唯一确定本次委托，结果未知，"
+                "请人工核对委托列表"
+            )
         field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
         deadline = time.monotonic() + timeout
-        last_error = None
+        last_error = "基线与候选均不满足唯一匹配"
+        last_candidates = []
         # 确认弹窗刚关闭时页面还没切到委托页，第一次读取必然拿不到表头。
         # 先留出切换与渲染时间，避免把"还没准备好"误报成"缺少列"。
-        time.sleep(1.2)
+        # 走 self.wait 而不是 time.sleep：子类/测试可以覆盖这段等待。
+        self.wait(1.2)
         while time.monotonic() < deadline:
             try:
                 self._solve_captcha_if_any()
@@ -668,23 +845,15 @@ class ClientTrader(IClientTrader):
                 time.sleep(0.5)
                 continue
 
-            matches = []
-            for row in rows:
-                number = str(row.get(field, "")).strip()
-                if not number:
-                    continue
-                if known is not None and number in known:
-                    continue
-                row_code = str(row.get("证券代码", "")).strip()
-                if row_code and row_code != code:
-                    continue
-                row_amount = str(row.get("委托数量", "")).strip()
-                if row_amount and int(float(row_amount)) != amount:
-                    continue
-                matches.append(row)
-
-            # 没有快照做参照时，多个候选无法判断哪个是本次的，不猜
-            if len(matches) == 1 or (known is not None and matches):
+            matches = [
+                row
+                for row in rows
+                if self._is_new_entrust_row(row, code, amount, known, field)
+            ]
+            last_candidates = [
+                str(row.get(field, "")).strip() for row in matches
+            ]
+            if len(matches) == 1:
                 row = matches[0]
                 return {
                     "entrust_no": str(row.get(field, "")).strip(),
@@ -693,11 +862,54 @@ class ClientTrader(IClientTrader):
                     "status": str(row.get("备注", "")).strip(),
                     "source": "委托列表回查",
                 }
+            if len(matches) > 1:
+                last_error = "出现多笔疑似本次委托，无法唯一确定"
             time.sleep(0.5)
         raise exceptions.TradeError(
-            "确认后未能在委托列表中找到本次委托，结果未知，请人工核对。"
-            "{}".format("查询错误: %s" % last_error if last_error else "")
+            "确认后未能在委托列表中找到唯一的本次委托，结果未知，请人工核对。"
+            "候选=%s；%s"
+            % (last_candidates or "无", "查询错误: %s" % last_error)
         )
+
+    def _is_new_entrust_row(self, row, code, amount, known, field):
+        """判断某行是否是本次新增且仍然有效的委托。
+
+        逐项硬条件，任何一项不满足都排除：
+        - 编号非空且不在基线里；
+        - 证券代码一致（行里没有该列时视为不满足，不做“空即匹配”的放宽）；
+        - 委托数量一致；
+        - 状态不是废单/失败/拒绝——这些行虽然“新出现”，但不是有效委托，
+          拿它的编号交给撤单只会得到一个假结果。
+        """
+        number = str(row.get(field, "")).strip()
+        if not number:
+            return False
+        if known is not None and number in known:
+            return False
+
+        row_code = str(row.get("证券代码", "")).strip()
+        if row_code != code:
+            return False
+
+        row_amount = str(row.get("委托数量", "")).strip()
+        if not row_amount:
+            return False
+        try:
+            # 必须**精确**相等：早先用 int(float(...)) 比较，100.9 会被截断成 100，
+            # 把数量不同的委托误认成本次的那一笔。这里按十进制比较。
+            if Decimal(row_amount.replace(",", "")) != Decimal(int(amount)):
+                return False
+        except (TypeError, ValueError, InvalidOperation):
+            return False
+
+        status = str(row.get("备注", "")).strip()
+        for bad in self._INVALID_ENTRUST_STATUS:
+            if bad in status:
+                return False
+        return True
+
+    # 这些状态说明委托没有被券商受理，不能当作“本次成功的委托”。
+    _INVALID_ENTRUST_STATUS = ("废单", "失败", "拒绝", "已撤", "撤单")
 
     @staticmethod
     def _verify_snapshot(snapshot, code, price, amount):

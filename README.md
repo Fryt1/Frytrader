@@ -117,6 +117,8 @@ finally:
 
 支持的客户端类型和交易方法见 [`docs/usage.md`](docs/usage.md)，MiniQMT 见 [`docs/miniqmt.md`](docs/miniqmt.md)。
 
+**当前交易边界**：同花顺单笔撤单不再降级为全撤；可靠单笔路径尚未验收，因此拒绝执行。市价委托也在提交前拒绝执行。限价、全撤、打新与正/逆回购不能由查询测试推定已全面验收，逐项状态见 [`docs/feature-validation.md`](docs/feature-validation.md)。
+
 后台只读模式限制：
 
 - `background=True` 仅支持 `ths`。传给其他适配器会抛 `NotImplementedError`，不会静默退回前台模式。

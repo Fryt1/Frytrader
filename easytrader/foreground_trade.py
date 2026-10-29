@@ -73,7 +73,23 @@ def _clean(text):
 class ConfirmSnapshot:
     """下单确认弹窗里的字段，全部来自客户端自己的渲染。"""
 
-    __slots__ = ("raw", "account", "security", "name", "price", "amount", "total")
+    __slots__ = (
+        "raw",
+        "account",
+        "security",
+        "name",
+        "price",
+        "amount",
+        "total",
+        "direction",
+    )
+
+    # 价格/数量前缀随页面不同：普通买卖是「买入/卖出/委托」，
+    # 债券回购页是「融资/融券/回购」。少写一种就会把 repo 的价格解析成空，
+    # 让 _verify_snapshot 把正常委托判成“无法校验”而中止。
+    _PRICE_RE = r"(?:买入|卖出|委托|融资|融券|回购)价格[:：]\s*([\d.]+)"
+    _AMOUNT_RE = r"(?:买入|卖出|委托|融资|融券|回购)数量[:：]\s*([\d]+)"
+    _DIRECTION_RE = r"确定以上\s*(买入|卖出|融资|融券)\s*委托"
 
     def __init__(self, raw):
         self.raw = raw
@@ -81,9 +97,12 @@ class ConfirmSnapshot:
         match = re.search(r"证券代码[:：]\s*(\d{6})\s*[（(]?([^）)\n]*)", raw)
         self.security = match.group(1) if match else None
         self.name = (match.group(2) or "").strip() if match else None
-        self.price = self._number(r"(?:买入|卖出|委托)价格[:：]\s*([\d.]+)")
-        self.amount = self._number(r"(?:买入|卖出|委托)数量[:：]\s*([\d]+)")
+        self.price = self._number(self._PRICE_RE)
+        self.amount = self._number(self._AMOUNT_RE)
         self.total = self._number(r"预估金额[:：]\s*([\d.]+)")
+        # 只有弹窗自己写明方向时才有值；解析不到就是 None，
+        # 调用方据此跳过方向比对，绝不拿“当前页面路径”去猜方向。
+        self.direction = self._field(self._DIRECTION_RE)
 
     def _field(self, pattern):
         match = re.search(pattern, self.raw)
@@ -101,6 +120,7 @@ class ConfirmSnapshot:
             "price": self.price,
             "amount": self.amount,
             "total": self.total,
+            "direction": self.direction,
         }
 
     def __repr__(self):
@@ -318,16 +338,50 @@ class ForegroundTradeChannel:
             time.sleep(0.4)
 
     def select_page(self, path):
-        """按左侧菜单路径切页（定向消息，不模拟鼠标）。"""
+        """按左侧菜单路径切页（定向消息，不模拟鼠标）。
+
+        **必须精确匹配**。pywinauto 的 ``get_item`` 默认走模糊匹配
+        (``limit_ratio=.6``)，而「融资回购（正回购）」和「融券回购（逆回购）」
+        只差一个字，模糊匹配很容易在两者之间挑错——那等于把正回购做成逆回购。
+        这里先按精确文本逐级查找，找不到就抛错，绝不退回模糊匹配。
+        """
         if not self.tree:
             raise exceptions.TradeError("缺少左侧菜单句柄，无法切换交易页面")
+        item = self.tree_get_item_exact(self.tree, list(path))
+        self._n.send_timeout(self.tree, TVM_SELECTITEM, TVGN_CARET, int(item))
+        time.sleep(0.6)
+
+    @staticmethod
+    def tree_get_item_exact(tree_hwnd, path):
+        """按精确文本逐级查找菜单项，返回 TVITEM 句柄。
+
+        不用 ``TreeViewWrapper.get_item``：它默认模糊匹配。
+        这里每级都要求 ``text()`` 完全相同，找不到就抛 ``TradeError``。
+        """
         from pywinauto.controls.common_controls import TreeViewWrapper
 
-        item = TreeViewWrapper(self.tree).get_item(list(path))
-        if item is None:
-            raise exceptions.TradeError("菜单项不存在: %s" % " / ".join(path))
-        self._n.send_timeout(self.tree, TVM_SELECTITEM, TVGN_CARET, int(item.elem))
-        time.sleep(0.6)
+        wrapper = TreeViewWrapper(int(tree_hwnd))
+        if not len(path):
+            raise exceptions.TradeError("菜单路径为空")
+        roots = wrapper.roots()
+        texts = [(r.text() or "").strip() for r in roots]
+        wanted = str(path[0]).strip()
+        if wanted not in texts:
+            raise exceptions.TradeError(
+                "左侧菜单没有「%s」（现有：%s）" % (wanted, "、".join(texts))
+            )
+        current = roots[texts.index(wanted)]
+        for wanted in path[1:]:
+            wanted = str(wanted).strip()
+            children = current.children()
+            child_texts = [(c.text() or "").strip() for c in children]
+            if wanted not in child_texts:
+                raise exceptions.TradeError(
+                    "菜单「%s」下没有「%s」（现有：%s）"
+                    % (current.text(), wanted, "、".join(child_texts))
+                )
+            current = children[child_texts.index(wanted)]
+        return int(current.elem)
 
     # ------------------------------------------------------------------
     # 弹窗
@@ -512,13 +566,15 @@ class ForegroundTradeChannel:
         ``{}`` 而不是抛错——委托编号由调用方回查委托列表确认，
         那里才是真正的权威来源。广告类提示（「成交价格预警服务」）会被
         识别并关掉，不会被误当成委托结果。
+
+        编号解析见 ``_extract_entrust_no``：只认编号字段后面的数字，
+        绝不在任意正文里捞数字。
         """
         if not self._safe_click(dialog, DIALOG_YES):
             raise exceptions.TradeError(
                 "委托确认弹窗上找不到“是”按钮，未提交，请人工核对"
             )
         deadline = time.monotonic() + timeout
-        seen = []
         while time.monotonic() < deadline:
             for hwnd in self.dialogs():
                 try:
@@ -529,16 +585,10 @@ class ForegroundTradeChannel:
                     continue
                 body = self.dialog_body(hwnd)
                 if body:
-                    seen.append(body[:80])
-                    match = re.search(
-                        r"(?:合同编号|委托编号|合同号|委托号)[:：]?\s*([0-9]{4,})",
-                        body,
-                    )
-                    if match is None and "成功" in body:
-                        match = re.search(r"[0-9]{4,}", body)
-                    if match is not None:
+                    entrust_no = self._extract_entrust_no(body)
+                    if entrust_no is not None:
                         self._dismiss(hwnd)
-                        return {"entrust_no": match.group(0)}
+                        return {"entrust_no": entrust_no}
                     # 有正文但没编号：多半是拒单原因
                     if "成功" in body or "失败" in body or "不足" in body:
                         self._dismiss(hwnd)
@@ -548,6 +598,24 @@ class ForegroundTradeChannel:
                 break
             time.sleep(0.12)
         return {}
+
+    # 委托编号字段。编号本身允许 3 位起：券商合同编号并不保证 4 位以上，
+    # 早先写死 {4,} 会把短编号当成“解析失败”。
+    _ENTRUST_NO_RE = re.compile(
+        r"(?:合同编号|委托编号|合同号|委托号|申请编号)[:：]?\s*([0-9]{3,})"
+    )
+
+    @staticmethod
+    def _extract_entrust_no(text):
+        """从提示框正文里取委托编号，取不到返回 None。
+
+        只认“编号字段 + 紧随其后的数字”，**不做**任何“正文里有数字就当编号”
+        的兜底：正文里同时出现价格、金额、代码时，随便抓一段数字会把错误的值
+        当成合同编号返回，而上层会拿它去撤单。
+        """
+        match = ForegroundTradeChannel._ENTRUST_NO_RE.search(text or "")
+        return match.group(1) if match else None
+
     def _dismiss(self, hwnd):
         """关掉一个提示框：优先“确定/是”，没有就发 WM_CLOSE。"""
         for button_id in (DIALOG_OK, DIALOG_YES, DIALOG_NO):
