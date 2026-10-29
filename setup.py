@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="frytrader",
-    version="0.1.0",
+    version="0.1.1",
     description="中国券商 GUI 交易适配器，支持同花顺远航版后台只读模式。",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
