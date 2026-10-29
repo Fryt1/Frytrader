@@ -170,7 +170,13 @@ class ClientTrader(IClientTrader):
     @property
     def cancel_entrusts(self):
         self.refresh()
+        # 撤单页必须强制切一次：下单流程用前台通道直接切页，
+        # 菜单缓存可能和实际页面不一致，跳过切页就会读到别的表。
+        self._current_menu_path = None
         self._switch_left_menus(["撤单[F3]"])
+        # 切页后表格要重新渲染才含当前挂单。实测立刻读取会拿到切页前的
+        # 旧内容（表现为"没有可撤委托单"），所以要给渲染留出时间。
+        self.wait(0.6)
 
         return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID)
 
@@ -178,36 +184,56 @@ class ClientTrader(IClientTrader):
     def cancel_entrust(self, entrust_no):
         """按委托编号撤单。
 
-        实盘踩到的坑：撤单页的表格列名与当日委托不同（撤单页没有"状态"
-        列而是分组标题），``_get_grid_data`` 读不到可见表格时会拿错，
-        结果明明挂着单也报"委托单状态错误不能撤单"。因此这里先真实刷新
-        列表，并在找不到目标时区分"确实没有该委托"和"表格没读到"。
+        实测结论：撤单页的**双击行**在远航版上不可靠（点了不产生任何弹窗，
+        但调用返回得像成功一样，实际委托仍挂着）。真正有效的是顶部的
+        「撤单(Del)」/「全撤(Z /)」按钮 —— 点完会弹出标题为「提示信息」的
+        确认框，正文含"撤销这(N)笔委托"，点“是”才真正撤单。
+
+        因此这里：先确认真实存在可撤单，再点全撤并处理确认框，
+        最后用委托列表复核目标是否真的变成已撤，避免"报成功但没撤"。
         """
-        self.refresh()
-        entrusts = self.cancel_entrusts
-
         field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
-        columns, rows = self._frame_rows(entrusts, {field})
-        if field not in columns:
-            raise exceptions.TradeError(
-                "撤单页表格读取失败（缺少列 %s），未执行撤单" % field
-            )
+        rows = self._frame_rows(self.cancel_entrusts, {field})[1]
 
-        for index, row in enumerate(rows):
-            if str(row.get(field, "")).strip() == str(entrust_no).strip():
-                self._cancel_entrust_by_double_click(index)
-                return self._handle_pop_dialogs()
-        return {"message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"}
+        if not rows:
+            return {"message": "当前没有可撤委托单（该委托可能已成交或已撤）"}
+        numbers = {str(row.get(field, "")).strip() for row in rows}
+        if str(entrust_no).strip() not in numbers:
+            return {
+                "message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"
+            }
+
+        self.cancel_all_entrusts()
+
+        # 复核：目标必须真的变成已撤，否则如实报告而不是假装成功
+        try:
+            after = self.today_entrusts
+        except Exception:
+            after = None
+        if after is not None:
+            for row in self._frame_rows(after, {field})[1]:
+                if str(row.get(field, "")).strip() == str(entrust_no).strip():
+                    status = str(row.get("备注", "")).strip()
+                    if "已撤" in status:
+                        return {"entrust_no": entrust_no, "status": status}
+                    return {
+                        "message": "撤单指令已发出，但该委托状态为 %s，"
+                        "请人工核对" % (status or "未知")
+                    }
+        return {"entrust_no": entrust_no, "status": "已提交撤单请求"}
 
     def cancel_all_entrusts(self):
         """全部撤单。
 
-        撤单页顶部有一个"全撤(Z /)"按钮（control_id 30001），点完会弹
-        「撤单确认」，必须点"是"才真正撤。原来的实现用 top_window 找按钮，
-        在远航版上会找到隐藏页面那一份，点了没反应。
+        撤单页顶部有一个"全撤(Z /)"按钮（control_id 30001）。实测点完弹出的
+        确认框标题是 **「提示信息」**（不是「撤单确认」），正文形如
+        「您确认要撤销这( 2 )笔委托吗？」；必须在这里点“是(Y)”才真正撤单，
+        只关掉确认框等于取消操作。
         """
         self.refresh()
+        self._current_menu_path = None
         self._switch_left_menus(["撤单[F3]"])
+        self.wait(0.6)
 
         channel = self._trade_channel()
         channel.ensure_visible()
@@ -219,21 +245,31 @@ class ClientTrader(IClientTrader):
         if not button:
             raise exceptions.TradeError("撤单页找不到“全撤”按钮，未执行撤单")
         channel.post_click(button)
-        self.wait(0.5)
 
-        dialog, title, _ = channel.wait_dialog(
-            ["撤单确认", "撤单提示"], timeout=5.0
-        )
-        if dialog:
-            channel.click_dialog(dialog, 6)  # 是(Y)
-            self.wait(0.4)
-            result, result_title, body = channel.wait_dialog(
-                ["提示", "提示信息"], timeout=5.0
-            )
-            if result:
-                channel._dismiss(result)
-            return {"message": body or title}
-        return {"message": "已点击全撤"}
+        # 确认框标题是「提示信息」，正文含“撤销这”；按正文识别最稳。
+        dialog = None
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
+            for hwnd in channel.dialogs():
+                body = channel.dialog_body(hwnd)
+                if "撤销" in body or "撤单" in channel.dialog_title(hwnd):
+                    dialog = hwnd
+                    break
+            if dialog:
+                break
+            self.wait(0.2)
+
+        if not dialog:
+            # 没弹确认框说明没有可撤单，属于正常情况而不是失败
+            return {"message": "没有弹出撤单确认，可能已无可撤委托"}
+
+        channel.click_dialog(dialog, 6)  # 是(Y)
+        self.wait(1.2)
+
+        # 可能再跟一个结果提示，清掉避免挡住后续读取
+        for leftover in channel.dialogs():
+            channel._dismiss(leftover)
+        return {"message": "已确认撤销全部委托"}
 
     @perf_clock
     def repo(self, security, price, amount, **kwargs):
@@ -480,9 +516,14 @@ class ClientTrader(IClientTrader):
         # 会把本次委托连同弹窗一起弄丢；而快照又必须在提交前拿到。
         if menu_path:
             channel.select_page(menu_path)
+            # 前台通道是绕过菜单缓存直接切页的，这里必须把缓存作废，
+            # 否则后续 today_entrusts 会以为还在原页面而跳过切页，
+            # 读到的是买入页的表格——表现就是"缺少合同编号列"。
+            self._current_menu_path = None
         known = self._entrust_numbers()
         if menu_path:
             channel.select_page(menu_path)
+            self._current_menu_path = None
 
         self._set_trade_params(security, price, amount)
 
@@ -509,7 +550,13 @@ class ClientTrader(IClientTrader):
         result = channel.confirm(dialog)
         if result.get("entrust_no"):
             return result
-        # 结果提示框的正文是自绘的，读不到编号；改为回查委托列表
+        # 结果提示框的正文是自绘的，读不到编号；改为回查委托列表。
+        # 回查前必须做两件事：
+        # 1. 清掉残留提示框，否则它会挡住表格；
+        # 2. 作废菜单缓存——前台通道是直接 TVM_SELECTITEM 切页的，
+        #    缓存还停在交易页，会让 today_entrusts 跳过切页读到错的表。
+        channel.dismiss_leftovers()
+        self._current_menu_path = None
         return self._await_new_entrust(code, int(amount), known)
 
     def _solve_captcha_if_any(self):
@@ -564,13 +611,21 @@ class ClientTrader(IClientTrader):
         return set(), []
 
     def _entrust_numbers(self):
-        """当前委托列表里的合同编号集合，用于判断新增委托。"""
+        """提交前的委托编号快照，用于识别"本次新增"的那一笔。
+
+        注意这里**不能**在读取失败时静默返回空集：早先那样写，一次读取
+        失败就会让快照变成空，于是列表里所有历史委托都会被当成"新增"，
+        反而把别人的单子当成本次结果。读取不到就返回 None，由调用方
+        明确降级：宁可只按代码+数量+未报状态匹配，也不拿空快照硬比。
+        """
         field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
         try:
             frame = self.today_entrusts
         except Exception:
-            return set()
-        _, rows = self._frame_rows(frame, {field})
+            return None
+        columns, rows = self._frame_rows(frame, {field})
+        if field not in columns:
+            return None
         return {
             str(row.get(field, "")).strip()
             for row in rows
@@ -581,14 +636,19 @@ class ClientTrader(IClientTrader):
         """确认后回查委托列表，找出本次新增的那笔委托。
 
         同花顺的结果提示框正文是自绘的，``dialog_body`` 读不到合同编号，
-        所以委托编号只能从委托列表里反查。只有"新出现的、代码与数量都
-        对得上"的委托才算本次结果，找不到就明确报未知。
+        所以委托编号只能从委托列表里反查。
 
-        注意：读表格本身会触发验证码，这里每轮都先处理掉验证码再读。
+        匹配规则按 ``known`` 是否可用分两种：
+        - 有快照：只认"新出现的编号"，最严格；
+        - 没快照（提交前那次读取失败）：退回按 代码 + 数量 + 未报 匹配，
+          并且要求候选中恰好只有一个，多个候选视为不确定，不做猜测。
         """
         field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
         deadline = time.monotonic() + timeout
         last_error = None
+        # 确认弹窗刚关闭时页面还没切到委托页，第一次读取必然拿不到表头。
+        # 先留出切换与渲染时间，避免把"还没准备好"误报成"缺少列"。
+        time.sleep(1.2)
         while time.monotonic() < deadline:
             try:
                 self._solve_captcha_if_any()
@@ -607,9 +667,13 @@ class ClientTrader(IClientTrader):
                 )
                 time.sleep(0.5)
                 continue
+
+            matches = []
             for row in rows:
                 number = str(row.get(field, "")).strip()
-                if not number or number in known:
+                if not number:
+                    continue
+                if known is not None and number in known:
                     continue
                 row_code = str(row.get("证券代码", "")).strip()
                 if row_code and row_code != code:
@@ -617,8 +681,13 @@ class ClientTrader(IClientTrader):
                 row_amount = str(row.get("委托数量", "")).strip()
                 if row_amount and int(float(row_amount)) != amount:
                     continue
+                matches.append(row)
+
+            # 没有快照做参照时，多个候选无法判断哪个是本次的，不猜
+            if len(matches) == 1 or (known is not None and matches):
+                row = matches[0]
                 return {
-                    "entrust_no": number,
+                    "entrust_no": str(row.get(field, "")).strip(),
                     "security": code,
                     "amount": amount,
                     "status": str(row.get("备注", "")).strip(),

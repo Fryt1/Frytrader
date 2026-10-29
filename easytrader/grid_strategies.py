@@ -19,11 +19,7 @@ from easytrader.utils.captcha import (
     captcha_recognize_improved,
     input_verify_code_manual,
 )
-from easytrader.utils.win_gui import (
-    SetForegroundWindow,
-    ShowWindow,
-    win32defines,
-)
+from easytrader.utils.win_gui import ShowWindow, win32defines
 
 if TYPE_CHECKING:
     # pylint: disable=unused-import
@@ -273,27 +269,10 @@ class BaseStrategy(IGridStrategy):
         pass
 
     @staticmethod
-    def _read_captcha_input(editor, retries=6, interval=0.03):
-        """读回验证码输入框里的内容，读不到返回空字符串。
-
-        这个控件和交易表单不同：它是标准 Edit，``window_text()`` 能读到
-        真实内容，因此可以用来断言"按键确实落进去了"。
-        """
-        for _ in range(retries):
-            try:
-                text = (editor.window_text() or "").strip()
-            except Exception:
-                text = ""
-            if text:
-                return text
-            time.sleep(interval)
-        return ""
-
-    @staticmethod
     def _fill_captcha(editor, code):
         """把验证码写入输入框。
 
-        三个实测得到的硬约束，缺一就会导致验证码永远失败：
+        四个实测得到的硬约束，缺一就会导致验证码永远失败：
 
         1. 该控件对 set_edit_text / WM_SETTEXT 无效，写入后内容仍为空，
            必须用 type_keys 模拟键盘输入；
@@ -301,31 +280,62 @@ class BaseStrategy(IGridStrategy):
            若不先真正清空，重试时会在旧内容后面继续追加，
            例如 "R2ku" + "R2ku" 变成 "R2kuR2ku"，每次都必然被拒绝。
            只有 BACKSPACE 能逐字符删除，所以这里按足够次数退格；
-        3. **必须让按键真正落到这个控件上**。早先两处 ``type_keys`` 都传了
-           ``set_foreground=False``，按键会发往"当时拥有焦点的窗口"而不是
-           验证码框：焦点只要不在框上，字符就落空，输入框始终是空的。
-           空值提交不会触发"验证码错误"，客户端只是不理会，于是每次都等到
-           超时才判失败——这正是"识别率明明很高、实测却大量失败"的真正原因。
-           因此这里先确认焦点，再逐段发送，并在清空与输入之间等待消息送达。
+        3. 必须先把对话框挂到自己的输入状态上（AttachThreadInput）才能
+           真正设进焦点。实测直接 set_focus() 后 GetFocus() 仍是 0，
+           焦点根本没进控件；
+        4. ``type_keys`` 默认会先调 SetForegroundWindow，而它在当前环境下
+           必定抛 "(0, 'SetForegroundWindow', 'No error message is
+           available')"。所以必须传 ``set_foreground=False``，由我们自己
+           负责把焦点准备好。这两点合起来才是"能打进去"的完整条件。
+
+        另注：该控件和交易表单一样拦截 WM_GETTEXT，``window_text()``
+        读回永远是空串，**不能**用它判断写入是否成功，只能看提交结果。
         """
-        editor.set_focus()
-        # 确认焦点真的在验证码框上，否则按键会落到别的地方
+        import win32api
+        import win32gui
+        import win32con
+        import win32process
+
+        handle = editor.wrapper_object().handle
         try:
-            import win32gui
-
-            handle = editor.wrapper_object().handle
-            if win32gui.GetFocus() != handle:
-                editor.set_focus()
+            root = win32gui.GetAncestor(handle, win32con.GA_ROOT)
         except Exception:
-            pass
-
-        # 16 次退格合并成一次发送，然后必须等它送完再输入，
-        # 否则退格与后续字符互相穿插，内容不可控。
-        editor.type_keys("{BACKSPACE 16}", pause=0.005)
-        time.sleep(0.08)
-        editor.type_keys(code, pause=0.01)
-        # 给客户端一点时间把字符回显、校验状态归位
-        time.sleep(0.05)
+            root = 0
+        dialog_thread = (
+            win32process.GetWindowThreadProcessId(root)[0] if root else 0
+        )
+        my_thread = win32api.GetCurrentThreadId()
+        attached = False
+        try:
+            if dialog_thread and dialog_thread != my_thread:
+                try:
+                    win32process.AttachThreadInput(my_thread, dialog_thread, True)
+                    attached = True
+                except Exception:
+                    attached = False
+            try:
+                win32gui.SetForegroundWindow(root)
+            except Exception:
+                # 前台锁定失败不致命：焦点仍可通过 AttachThreadInput 设置
+                pass
+            time.sleep(0.12)
+            try:
+                win32gui.SetFocus(handle)
+            except Exception:
+                pass
+            # 16 次退格合并成一次发送，然后必须等它送完再输入，
+            # 否则退格与后续字符互相穿插，内容不可控。
+            editor.type_keys("{BACKSPACE 16}", set_foreground=False, pause=0.005)
+            time.sleep(0.08)
+            editor.type_keys(code, set_foreground=False, pause=0.02)
+            # 给客户端一点时间把字符回显、校验状态归位
+            time.sleep(0.08)
+        finally:
+            if attached:
+                try:
+                    win32process.AttachThreadInput(my_thread, dialog_thread, False)
+                except Exception:
+                    pass
 
     def _set_foreground(self, control=None):
         try:
@@ -511,21 +521,11 @@ class Copy(BaseStrategy):
                 editor = self._captcha_editor(dialog)
                 self._fill_captcha(editor, captcha_num)
 
-                # 提交前必须确认字符真的进了输入框：空着提交不会报错，
-                # 客户端只是不理会，最后一定等到超时，白白浪费一次机会。
-                typed = self._read_captcha_input(editor)
-                if not typed:
-                    logger.warning("验证码未写入输入框（焦点未转移），重试")
-                    self._refresh_captcha(dialog)
-                    continue
-                if typed != captcha_num:
-                    logger.warning(
-                        "验证码输入框内容与识别结果不一致（%r != %r），重试",
-                        typed,
-                        captcha_num,
-                    )
-                    self._refresh_captcha(dialog)
-                    continue
+                # 这里**不能**用 window_text() 回读校验。
+                # 实测截图证明字符已经正确进入输入框，但该控件和交易表单
+                # 一样拦截了 WM_GETTEXT，window_text() 永远返回空串。
+                # 早先据此判定"未写入"会 8 次全部放弃，把正确输入误杀。
+                # 输入是否成功只能靠提交结果（弹窗关闭 / "验证码错误"）判断。
 
                 self._captcha_button(dialog, self.CAPTCHA_OK_BUTTON_ID).click()
 

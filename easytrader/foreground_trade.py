@@ -149,29 +149,39 @@ class ForegroundTradeChannel:
         import win32gui
         import win32process
 
+        # 先试一次：前台已经属于下单进程就不用动它
         if self._foreground_pid() == self._pid:
             return True
-        foreground = win32gui.GetForegroundWindow()
-        foreground_thread = (
-            win32process.GetWindowThreadProcessId(foreground)[0] if foreground else 0
-        )
+
+        # 挂到 **目标窗口自己的** 线程上再置前。
+        # 实测：挂到"当前前台线程"上会抛 "(0, 'SetForegroundWindow',
+        # 'No error message is available')"，而挂到目标线程上能成功——
+        # 后者正是验证码对话框那边已经验证通的做法。
+        target_thread = 0
+        try:
+            target_thread = win32process.GetWindowThreadProcessId(self.root)[0]
+        except Exception:
+            target_thread = 0
         my_thread = win32api.GetCurrentThreadId()
         attached = False
         try:
-            if foreground_thread and foreground_thread != my_thread:
-                win32process.AttachThreadInput(foreground_thread, my_thread, True)
+            if target_thread and target_thread != my_thread:
+                win32process.AttachThreadInput(my_thread, target_thread, True)
                 attached = True
-            # 模拟一次 ALT，绕开系统的前台锁定
             win32api.keybd_event(0x12, 0, 0, 0)
             win32api.keybd_event(0x12, 0, 2, 0)
             win32gui.BringWindowToTop(self.root)
-            win32gui.SetForegroundWindow(self.root)
+            try:
+                win32gui.SetForegroundWindow(self.root)
+            except Exception:
+                pass
+            win32gui.SetFocus(self.root)
         except Exception as exc:  # pragma: no cover - 依赖当前桌面状态
             logger.warning("激活下单窗口失败: %s", exc)
         finally:
             if attached:
                 try:
-                    win32process.AttachThreadInput(foreground_thread, my_thread, False)
+                    win32process.AttachThreadInput(my_thread, target_thread, False)
                 except Exception:
                     pass
         return self._foreground_pid() == self._pid

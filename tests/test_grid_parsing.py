@@ -168,13 +168,69 @@ class TestCaptchaInput(unittest.TestCase):
 
         grid_strategies.BaseStrategy._fill_captcha(editor, "Ab3d")
 
-        editor.set_focus.assert_called()
         editor.set_edit_text.assert_not_called()
 
         typed = [call.args[0] for call in editor.type_keys.call_args_list]
         self.assertIn("Ab3d", typed)
         # 必须最后输入验证码本身
         self.assertEqual(typed[-1], "Ab3d")
+
+    def test_typing_never_lets_pywinauto_take_foreground(self):
+        """type_keys 必须显式传 set_foreground=False。
+
+        实测该环境下 pywinauto 内部的 SetForegroundWindow 必定抛
+        "(0, 'SetForegroundWindow', 'No error message is available')"；
+        一旦让它自己去置前，整个写入直接失败。前台与焦点由我们自己在
+        AttachThreadInput 之后处理。
+        """
+        editor = mock.MagicMock()
+        editor.type_keys.side_effect = lambda keys, **kwargs: keys
+
+        grid_strategies.BaseStrategy._fill_captcha(editor, "Ab3d")
+
+        for call in editor.type_keys.call_args_list:
+            self.assertIs(
+                call.kwargs.get("set_foreground"),
+                False,
+                "type_keys 必须传 set_foreground=False：%r" % (call,),
+            )
+
+    def test_focus_is_set_after_attaching_dialog_thread(self):
+        """必须先挂上对话框线程再 SetFocus。
+
+        实测直接 editor.set_focus() 之后 GetFocus() 仍是 0，说明焦点根本没
+        进控件；只有 AttachThreadInput 之后 SetFocus 才生效。
+
+        win32 模块是在 _fill_captcha 内部导入的，所以直接 patch 真正的
+        win32gui / win32process 模块对象。
+        """
+        import win32gui as real_gui
+        import win32process as real_process
+
+        editor = mock.MagicMock()
+        handle = 0x1234
+        editor.wrapper_object.return_value.handle = handle
+        editor.type_keys.side_effect = lambda keys, **kwargs: keys
+
+        with mock.patch.object(
+            real_gui, "GetAncestor", return_value=0x9999
+        ), mock.patch.object(
+            real_process,
+            "GetWindowThreadProcessId",
+            return_value=(4242, 1),
+        ), mock.patch.object(
+            real_process, "AttachThreadInput"
+        ) as attach, mock.patch.object(
+            real_gui, "SetFocus"
+        ) as set_focus, mock.patch.object(
+            real_gui, "SetForegroundWindow"
+        ):
+            grid_strategies.BaseStrategy._fill_captcha(editor, "Ab3d")
+
+        attach.assert_called()
+        # 挂线程必须成对（挂上再解挂）
+        self.assertGreaterEqual(attach.call_count, 2)
+        set_focus.assert_called_with(handle)
 
     def test_stale_captcha_text_is_backspaced_away(self):
         """重试前必须真正清空输入框。
