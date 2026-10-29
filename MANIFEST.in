@@ -1,5 +1,6 @@
 include README.md
 recursive-include easytrader/config *.json *.ahk
 recursive-include easytrader/native *.c *.def *.ps1 *.dll *.exe
+recursive-include easytrader/utils/captcha_model *.onnx *.onnx.data
 recursive-include docs *.md
 include INSTALL.md

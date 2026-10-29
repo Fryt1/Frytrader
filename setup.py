@@ -26,6 +26,8 @@ setup(
         "pillow>=8.0.0",
         "pandas>=1.1.0",
         "pytesseract>=0.3.7",
+        "onnxruntime>=1.15.0; sys_platform == 'win32'",
+        "onnx>=1.14.0; sys_platform == 'win32'",
         "beautifulsoup4>=4.9.0",
         "bs4>=0.0.1",
         "certifi>=2020.6.20",
@@ -65,6 +67,10 @@ setup(
             "config/*.json", "config/*.ahk", "native/*.c",
             "native/*.def", "native/*.ps1", "native/bin/*.dll",
             "native/bin/*.exe",
-        ]
+        ],
+        # 验证码 ONNX 模型随包分发：没有它就退回不了任何识别能力
+        "easytrader.utils": [
+            "captcha_model/*.onnx", "captcha_model/*.onnx.data",
+        ],
     },
 )

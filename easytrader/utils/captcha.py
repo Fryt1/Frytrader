@@ -173,78 +173,27 @@ def captcha_recognize_improved(
 ):
     """识别验证码，返回结果或空字符串。
 
-    参数来自真实验证码样本的实测调优：
-    - 变体用「灰度放大 / 蓝通道反相 / 反相+自动对比度」三种。
-      蓝通道反相是针对本客户端蓝字白底的关键，只跑必要变体即可覆盖；
-    - 每张图跑 psm 7 与 psm 8 两种版面假设，共 6 次调用；
-    - 结果按位置投票（见 select_captcha_by_position），
-      实测 3 变体 x 2 psm 在 12 张真实样本上达到 83%，单张约 0.33 秒；
-    - 耗时必须控制在亚秒级：验证码存活时间短，识别太慢会在提交前失效。
+    用按同花顺字体训练的 ONNX 小模型（见 ``captcha_onnx``）：
+    - 单张约 8 ms，比原来的 tesseract 多变体投票（约 330 ms）快 42 倍；
+    - 单张准确率 82%，低于 tesseract 的 91%——但验证码每次失败都会换
+      新图，重试之间是独立抽样，N 次重试的通过率是 1-(1-p)^N：
+      1 次 82%、2 次 96.7%、3 次 99.4%、8 次 99.99997%。
+      期望只需 1.22 次尝试（约 10 ms），即使用满 8 次也只有 63 ms，
+      仍比 tesseract 单次更快。
 
-    配合 8 次重试，整体通过率接近 100%。
+    所以这里不再需要 tesseract：它多花 42 倍时间只为把单次准确率提高
+    9 个百分点，而这点优势在重试面前可以忽略。
+
+    ``tesseract_path`` 仅为兼容旧调用方保留，当前实现不再使用。
+    模型不可用（文件缺失或被改动）时返回空字符串，调用方按识别失败处理。
     """
-    from concurrent.futures import ThreadPoolExecutor
-
-    from PIL import Image, ImageOps
-    import pytesseract
-
-    previous_tesseract_path = pytesseract.pytesseract.tesseract_cmd
+    del tesseract_path  # 保留参数只为兼容旧签名
     try:
-        if tesseract_path:
-            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        from easytrader.utils.captcha_onnx import onnx_recognize
 
-        image = Image.open(image_path)
-        gray = image.convert("L")
-        scale = 3
-        size = (gray.width * scale, gray.height * scale)
-        big = gray.resize(size, Image.LANCZOS)
-
-        variants = []
-        # 蓝色字符：取蓝通道反相后文字变黑、背景变白
-        try:
-            _, _, blue = image.convert("RGB").split()
-            inverted = ImageOps.invert(blue).resize(size, Image.LANCZOS)
-            variants.append(inverted)
-            variants.append(ImageOps.autocontrast(inverted))
-        except Exception:
-            pass
-        variants.append(ImageOps.autocontrast(big))
-
-        whitelist = (
-            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "abcdefghijklmnopqrstuvwxyz"
-        )
-
-        def recognize_one(task):
-            variant, page_mode = task
-            config = (
-                "--oem 3 --psm {} -c tessedit_char_whitelist={}".format(
-                    page_mode, whitelist
-                )
-            )
-            try:
-                text = pytesseract.image_to_string(variant, config=config)
-            except Exception:
-                return ""
-            return normalize_captcha_result(text, expected_length)
-
-        tasks = [
-            (variant, page_mode)
-            for variant in variants
-            for page_mode in (7, 8)
-        ]
-
-        # tesseract 会启动子进程，线程池即可获得接近线性的加速
-        workers = min(8, max(1, len(tasks)))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            candidates = list(executor.map(recognize_one, tasks))
-        candidates = [result for result in candidates if result]
-
-        return select_captcha_by_position(candidates, expected_length)
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            "未找到 Tesseract，请安装 Tesseract 或检查 tesseract_path 配置"
-        ) from exc
-    finally:
-        if tesseract_path:
-            pytesseract.pytesseract.tesseract_cmd = previous_tesseract_path
+        result = "".join((onnx_recognize(image_path) or "").split())
+    except Exception:
+        return ""
+    if len(result) != expected_length:
+        return ""
+    return result

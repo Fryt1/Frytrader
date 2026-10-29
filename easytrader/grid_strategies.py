@@ -115,6 +115,51 @@ def _top_level_windows_of(app) -> List[int]:
     return handles
 
 
+def _force_foreground(handle):
+    """把窗口真正变成前台窗口，返回是否成功。
+
+    系统只允许"当前前台进程"或满足豁免条件的进程改前台，直接调用
+    ``SetForegroundWindow`` 往往会失败且不报错。临时把自己的线程输入
+    状态挂到当前前台线程上，就能绕过这个限制；用完必须解挂。
+    """
+    if not handle:
+        return False
+    try:
+        import win32api
+        import win32gui
+        import win32process
+
+        if win32gui.GetForegroundWindow() == handle:
+            return True
+        foreground = win32gui.GetForegroundWindow()
+        foreground_thread = (
+            win32process.GetWindowThreadProcessId(foreground)[0] if foreground else 0
+        )
+        my_thread = win32api.GetCurrentThreadId()
+        attached = False
+        try:
+            if foreground_thread and foreground_thread != my_thread:
+                win32process.AttachThreadInput(foreground_thread, my_thread, True)
+                attached = True
+            # 模拟一次 ALT 按下/抬起，解锁前台切换
+            win32api.keybd_event(0x12, 0, 0, 0)
+            win32api.keybd_event(0x12, 0, 2, 0)
+            win32gui.BringWindowToTop(handle)
+            win32gui.SetForegroundWindow(handle)
+        finally:
+            if attached:
+                try:
+                    win32process.AttachThreadInput(
+                        foreground_thread, my_thread, False
+                    )
+                except Exception:
+                    pass
+        return win32gui.GetForegroundWindow() == handle
+    except Exception:
+        logger.debug("强制置前失败", exc_info=True)
+        return False
+
+
 def _drop_empty_rows(df: "pd.DataFrame") -> List[Dict]:
     """丢弃全空占位行。
 
@@ -228,23 +273,59 @@ class BaseStrategy(IGridStrategy):
         pass
 
     @staticmethod
+    def _read_captcha_input(editor, retries=6, interval=0.03):
+        """读回验证码输入框里的内容，读不到返回空字符串。
+
+        这个控件和交易表单不同：它是标准 Edit，``window_text()`` 能读到
+        真实内容，因此可以用来断言"按键确实落进去了"。
+        """
+        for _ in range(retries):
+            try:
+                text = (editor.window_text() or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                return text
+            time.sleep(interval)
+        return ""
+
+    @staticmethod
     def _fill_captcha(editor, code):
         """把验证码写入输入框。
 
-        两个实测得到的硬约束，缺一就会导致验证码永远失败：
+        三个实测得到的硬约束，缺一就会导致验证码永远失败：
 
         1. 该控件对 set_edit_text / WM_SETTEXT 无效，写入后内容仍为空，
            必须用 type_keys 模拟键盘输入；
         2. Ctrl+A / Delete 在该控件上同样无效，清不掉上一次的错误内容。
            若不先真正清空，重试时会在旧内容后面继续追加，
            例如 "R2ku" + "R2ku" 变成 "R2kuR2ku"，每次都必然被拒绝。
-           只有 BACKSPACE 能逐字符删除，所以这里按足够次数退格。
+           只有 BACKSPACE 能逐字符删除，所以这里按足够次数退格；
+        3. **必须让按键真正落到这个控件上**。早先两处 ``type_keys`` 都传了
+           ``set_foreground=False``，按键会发往"当时拥有焦点的窗口"而不是
+           验证码框：焦点只要不在框上，字符就落空，输入框始终是空的。
+           空值提交不会触发"验证码错误"，客户端只是不理会，于是每次都等到
+           超时才判失败——这正是"识别率明明很高、实测却大量失败"的真正原因。
+           因此这里先确认焦点，再逐段发送，并在清空与输入之间等待消息送达。
         """
         editor.set_focus()
-        # 验证码只有 4 位，退格次数留足余量以清掉历史累积内容。
-        # 16 次退格合并成一次 type_keys 发送，避免每个按键的往返开销。
-        editor.type_keys("{BACKSPACE 16}", set_foreground=False, pause=0.005)
-        editor.type_keys(code, set_foreground=False, pause=0.01)
+        # 确认焦点真的在验证码框上，否则按键会落到别的地方
+        try:
+            import win32gui
+
+            handle = editor.wrapper_object().handle
+            if win32gui.GetFocus() != handle:
+                editor.set_focus()
+        except Exception:
+            pass
+
+        # 16 次退格合并成一次发送，然后必须等它送完再输入，
+        # 否则退格与后续字符互相穿插，内容不可控。
+        editor.type_keys("{BACKSPACE 16}", pause=0.005)
+        time.sleep(0.08)
+        editor.type_keys(code, pause=0.01)
+        # 给客户端一点时间把字符回显、校验状态归位
+        time.sleep(0.05)
 
     def _set_foreground(self, control=None):
         try:
@@ -259,7 +340,10 @@ class BaseStrategy(IGridStrategy):
             if control.has_style(win32defines.WS_MINIMIZE):  # if minimized
                 ShowWindow(window, 9)  # restore window state
             else:
-                SetForegroundWindow(window)  # bring to front
+                # 直接 SetForegroundWindow 会受前台锁定限制而静默失败，
+                # 焦点没转移时后续键入会落到别的窗口，验证码必然是空的。
+                # 用 AttachThreadInput 临时共享输入状态再置前，成功率更高。
+                _force_foreground(window)
         except Exception:
             logger.debug("置前窗口失败", exc_info=True)
 
@@ -424,7 +508,25 @@ class Copy(BaseStrategy):
                     self._refresh_captcha(dialog)
                     continue
 
-                self._fill_captcha(self._captcha_editor(dialog), captcha_num)
+                editor = self._captcha_editor(dialog)
+                self._fill_captcha(editor, captcha_num)
+
+                # 提交前必须确认字符真的进了输入框：空着提交不会报错，
+                # 客户端只是不理会，最后一定等到超时，白白浪费一次机会。
+                typed = self._read_captcha_input(editor)
+                if not typed:
+                    logger.warning("验证码未写入输入框（焦点未转移），重试")
+                    self._refresh_captcha(dialog)
+                    continue
+                if typed != captcha_num:
+                    logger.warning(
+                        "验证码输入框内容与识别结果不一致（%r != %r），重试",
+                        typed,
+                        captcha_num,
+                    )
+                    self._refresh_captcha(dialog)
+                    continue
+
                 self._captcha_button(dialog, self.CAPTCHA_OK_BUTTON_ID).click()
 
                 # 轮询等待结果，而不是固定 sleep：
