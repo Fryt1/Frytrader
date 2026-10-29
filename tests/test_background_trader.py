@@ -118,6 +118,11 @@ class FakeBackend:
     def check_captcha(self, cap):
         return cap is self.caps
 
+    def cancel_captcha(self, cap):
+        if cap is not self.caps:
+            raise RuntimeError("wrong captcha")
+        self.copy_requested = False
+
     def capture_captcha(self, image):
         result = Image.new("RGB", (16, 8), "white")
         result.putpixel((self.image_version, 1), (0, 120, 255))
@@ -178,7 +183,11 @@ class ReadonlyInterfaceTests(unittest.TestCase):
 
     def test_trading_and_login_are_rejected_before_worker_starts(self):
         user = BackgroundThsTrader()
-        for name in ("buy", "sell", "cancel_entrust", "auto_ipo", "prepare"):
+        for name in (
+            "buy", "sell", "market_buy", "market_sell", "trade", "market_trade",
+            "cancel_entrust", "cancel_all_entrusts", "auto_ipo", "repo",
+            "reverse_repo", "prepare", "login", "exit",
+        ):
             with self.subTest(operation=name):
                 with self.assertRaises(PermissionError):
                     getattr(user, name)("irrelevant")
@@ -191,7 +200,7 @@ class ReadonlyInterfaceTests(unittest.TestCase):
             {"captcha_retries": True},
             {"captcha_retries": 0},
             {"poll_interval": 0},
-            {"desktop_name": ""},
+            {"allow_foreground_captcha": "yes"},
         ):
             with self.subTest(options=options):
                 with self.assertRaises(ValueError):
@@ -359,9 +368,18 @@ class EngineTests(unittest.TestCase):
         runtime.fill.assert_called_once()
         runtime.click.assert_not_called()
         self.assertTrue(backend.protection_ended)
-        focus.close.assert_called_once()
+        self.assertGreaterEqual(focus.close.call_count, 1)
         self.assertFalse(engine.last_report["ok"])
         self.assertEqual(backend.restore_calls, 0)
+
+    def test_foreground_captcha_can_be_disabled_before_input(self):
+        backend = FakeBackend()
+        runtime = FakeRuntime(backend)
+        with self.assertRaisesRegex(BackgroundError, "未允许"):
+            self.run_engine(backend, runtime, allow_foreground_captcha=False)
+        self.assertEqual(runtime.calls, [])
+        self.assertFalse(backend.copy_requested)
+        self.assertTrue(backend.protection_ended)
 
     def test_rejection_refreshes_before_next_attempt(self):
         backend = FakeBackend()
@@ -403,7 +421,7 @@ class EngineTests(unittest.TestCase):
         backend = mock.Mock()
         engine = _Engine(BackgroundOptions(), backend=backend)
         with mock.patch(
-            "easytrader.background_trader.AutoHotkeyControls",
+            "easytrader.background_focus.ThreadActivationGuard",
             side_effect=BackgroundError("missing runtime"),
         ):
             with self.assertRaises(BackgroundError):

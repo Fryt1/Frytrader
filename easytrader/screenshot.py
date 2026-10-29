@@ -3,8 +3,8 @@
 
 适用场景
 --------
-同花顺 Voyager 客户端被放在 Windows「任务视图」的另一个虚拟桌面上，
-由 AutoHotkey 按控件定向发送消息（ControlSendText / ControlClick）操作。
+同花顺 Voyager 主窗口隐藏，查询通过定向控件消息执行，
+验证码按需临时前台输入。
 这时验证码图片抓不到：窗口不在用户当前虚拟桌面上，或窗口被遮挡、
 位于屏幕外，ImageGrab / pywinauto 的 capture_as_image 读的是屏幕像素，
 会抛 "screen grab failed"。

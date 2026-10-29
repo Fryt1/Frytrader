@@ -2,7 +2,7 @@
 
 [![standard-readme compliant](https://img.shields.io/badge/readme%20style-standard-brightgreen.svg?style=flat-square)](https://github.com/RichardLitt/standard-readme)
 
-中国券商 GUI 交易适配器，支持同花顺远航版免打扰后台只读模式。
+中国券商 GUI 交易适配器，支持同花顺远航版隐藏窗口只读查询（验证码按需前台）。
 
 Frytrader 是 [EasyTrader](https://github.com/shidenggui/easytrader) 的 fork，在保留上游交易核心和 `import easytrader` 导入名的前提下，增强了验证码识别、表格导出和后台只读能力。发行包名为 `frytrader`，与 PyPI 上游的 `easytrader` 区分；Python 导入名仍为 `easytrader`，已有代码无需修改。
 
@@ -33,9 +33,9 @@ Frytrader 是 [EasyTrader](https://github.com/shidenggui/easytrader) 的 fork，
 
 EasyTrader 提供多种券商 GUI、雪球和 MiniQMT 适配器。Frytrader 保留上游交易核心，并针对通用 Windows GUI 客户端做了三类增强：
 
-1. **验证码识别**：多图变体 OCR、按位投票，减少误识别。
+1. **验证码识别**：随包提供同花顺专用 ONNX 模型，支持大小写字母与数字。
 2. **表格导出**：修正空行丢弃、陈旧数据判断和失败诊断。
-3. **后台只读模式**：任务视图隔离 + 定向控件消息 + 线程激活保护，在不抢键盘、鼠标、前台和任务视图桌面的前提下读取资金、持仓、委托与成交。
+3. **隐藏窗口只读查询**：普通查询通过定向控件消息完成；验证码输入与确认可以临时占前台，结束后收起窗口并归还焦点。不再创建或切换任务视图桌面。
 
 本项目不是券商原生 API。GUI 路线适合低频操作，不适合高频交易。MiniQMT 是可选的另一条路径，安装 Python 依赖不授予券商权限，也不会解除券商端限制。
 
@@ -59,7 +59,7 @@ $ .\.venv\Scripts\Activate.ps1
 $ python -m pip install -e .
 ```
 
-安装后台模式依赖：
+后台模式使用主依赖，以下旧 extra 命令也可兼容使用：
 
 ```console
 $ python -m pip install -e ".[background]"
@@ -71,9 +71,9 @@ $ python -m pip install -e ".[background]"
 $ python -m pip install -e ".[miniqmt]"
 ```
 
-验证码识别需要另行安装 [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki)，让 `tesseract.exe` 可从 `PATH` 访问，或在配置中指定路径。
+同花顺查询验证码使用随包 ONNX 模型，不需要 Tesseract。其他历史券商识别入口若使用 Tesseract，仍需单独安装并配置路径。
 
-后台只读模式还需要 [AutoHotkey v2](https://www.autohotkey.com/)。程序按 `ahk_path` 参数 → `FRYTRADER_AHK` 环境变量 → `%LOCALAPPDATA%\Frytrader\runtime\AutoHotkey64.exe` → `PATH` → 常规安装目录依次查找，**不会在运行时自动下载或安装软件**。
+隐藏查询不需要 pyvda、AutoHotkey 或额外桌面；不在运行时自动下载或安装软件。
 
 ## 用法
 
@@ -89,7 +89,7 @@ print(user.balance)
 print(user.position)
 ```
 
-同花顺远航版后台只读模式（不抢焦点）：
+同花顺远航版隐藏窗口只读查询（验证码允许临时前台）：
 
 ```python
 import easytrader
@@ -105,11 +105,11 @@ finally:
     user.close()
 ```
 
-后台模式的用时数据来自本机登录态实测：公开接口连续两轮 8 次读取全部成功，零桌面和前台干扰。资金约 0.44 秒，三类表格 1.2–6.7 秒（取决于验证码重试次数）。详见 [`docs/background.md`](docs/background.md)。
+本次同桌面只读验收四项均成功：资金 5 项、持仓空表、当日委托 16 条、当日成交空表；三个验证码均首次通过。资金约 0.55 秒，其余查询约 2.17–2.94 秒。查询结束主窗口隐藏、验证码已关闭、焦点归还。详见 [`docs/background.md`](docs/background.md)。
 
-**尚未验证**：非空持仓/委托/成交数据、长时间无人值守稳定性、非 x86 客户端、非 Windows 平台。
+**尚未验证**：非空持仓/成交数据、长时间无人值守稳定性、非 x86 客户端、非 Windows 平台。通过查询测试不等于所有交易功能已验收。
 
-**后台模式不支持交易**。买入、卖出、撤单、打新和逆回购需改用前台模式 `easytrader.use("ths")`，因为同花顺交易表单在写入时会取得前台焦点，这是客户端行为。详见 [为什么后台模式不支持下单](docs/background.md#为什么后台模式不支持下单)。
+**后台模式不支持交易**。买入、卖出、撤单、打新和逆回购需改用前台模式 `easytrader.use("ths")`，因为同花顺交易表单在写入时会取得前台焦点，这是客户端行为。查询对象与前台交易对象分别使用，不应把查询通过当成交易验收。
 
 ## API
 
@@ -121,7 +121,8 @@ finally:
 
 - `background=True` 仅支持 `ths`。传给其他适配器会抛 `NotImplementedError`，不会静默退回前台模式。
 - 后台模式不继承下单能力，`buy`、`sell`、`cancel_entrust`、`prepare`、`login`、`auto_ipo` 等一律抛 `PermissionError`。
-- 默认 `close()` 只停止后台执行器，不取消验证码、不搬回窗口。需要恢复窗口位置时显式调用 `user.restore_windows()`。
+- 默认 `close()` 停止查询执行器并保持主窗口隐藏；查询失败只清理本次创建的验证码。显式调用 `user.restore_windows()` 可显示原本可见的主窗口，不操作桌面。
+- 默认 `allow_foreground_captcha=True`；设为 `False` 时查询遇验证码就失败，不发送前台输入。客户端自行显示的验证码仍可能短暂可见。
 
 ## 配置
 

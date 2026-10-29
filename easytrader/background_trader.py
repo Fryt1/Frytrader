@@ -1,7 +1,7 @@
-"""Read-only Voyager automation on a Windows Task View virtual desktop.
+"""Readonly queries with hidden main windows and bounded foreground captchas.
 
-This adapter has no foreground/keyboard fallback and does not inherit the
-order-capable ClientTrader. Its worker owns COM objects and serializes reads.
+No extra virtual desktop is created. Only an identified query captcha may
+receive foreground input; this adapter never inherits order capabilities.
 """
 
 import atexit
@@ -17,7 +17,6 @@ from pathlib import Path
 import pandas as pd
 
 from easytrader.background_runtime import (
-    AutoHotkeyControls,
     BackgroundError,
     BackgroundInterference,
 )
@@ -35,7 +34,7 @@ PAGES = {
 @dataclass(frozen=True)
 class BackgroundOptions:
     ahk_path: object = None
-    desktop_name: str = "Frytrader 后台"
+    allow_foreground_captcha: bool = True
     timeout: float = 15.0
     captcha_retries: int = 5
     poll_interval: float = 0.02
@@ -46,11 +45,8 @@ class BackgroundOptions:
     def __post_init__(self):
         if not isinstance(self.restore_on_close, bool):
             raise ValueError("restore_on_close 必须是布尔值")
-        if (
-            not isinstance(self.desktop_name, str)
-            or not self.desktop_name.strip()
-        ):
-            raise ValueError("desktop_name 不能为空")
+        if not isinstance(self.allow_foreground_captcha, bool):
+            raise ValueError("allow_foreground_captcha 必须是布尔值")
         if not 2 <= self.timeout <= 120:
             raise ValueError("timeout 必须在 2 到 120 秒之间")
         if (
@@ -93,9 +89,12 @@ class QueryGuard:
         try:
             if self.backend.current_desktop_id() != self.source:
                 raise BackgroundInterference(
-                    "检测到任务视图桌面变化，后台操作已停止"
+                    "Windows 输入桌面变化（锁屏或安全提示），查询已停止"
                 )
-            if self.backend.foreground_pid() in (
+            foreground_check = getattr(self.backend, "assert_query_foreground", None)
+            if foreground_check is not None:
+                foreground_check()
+            elif self.backend.foreground_pid() in (
                 self.backend.owner_pid,
                 self.backend.trader_pid,
             ):
@@ -126,8 +125,6 @@ class QueryGuard:
         self.sample()
 
     def start(self):
-        if self.source == self.backend.target_desktop_id:
-            raise BackgroundError("正在同花顺桌面操作时，后台读取暂停")
         self.check()
 
         def observe():
@@ -222,9 +219,7 @@ class _Engine:
     def connect(self, exe_path=None):
         if self.connected:
             return
-        # Validate dependencies before moving any window.
-        if self.runtime is None:
-            self.runtime = AutoHotkeyControls(self.options.ahk_path)
+        # Validate dependencies before hiding any window.
         if self.focus is None:
             from easytrader.background_focus import ThreadActivationGuard
 
@@ -240,7 +235,10 @@ class _Engine:
                 raise BackgroundError(
                     "客户端已有验证码，请先处理后连接后台模式"
                 )
-            self.backend.enter_background(self.options.desktop_name)
+            if self.runtime is None:
+                from easytrader.query_captcha import ForegroundCaptchaControls
+                self.runtime = ForegroundCaptchaControls(self.backend)
+            self.backend.enter_background()
             self.connected = True
         except Exception:
             self.backend.restore()
@@ -299,9 +297,17 @@ class _Engine:
             if not self.backend.check_captcha(cap):
                 raise BackgroundError("验证码控件已改变")
             self.owned_captcha = cap
+            if not options.allow_foreground_captcha:
+                raise BackgroundError("本次查询需要验证码，但未允许临时前台输入")
+            # Release the activation veto ONLY for this validated query captcha.
+            if guard.activation_guard is not None:
+                guard.activation_guard = None
+                self.focus.close()
+                self.last_report["foreground_captcha"] = True
             if attempts >= options.captcha_retries:
                 raise BackgroundError("验证码未通过，未使用任何前台输入回退")
             attempts += 1
+            self.last_report["captcha_attempts"] = attempts
             self.last_report["phase"] = "capture_captcha"
             image = self._captcha_image(cap, guard)
             extrema = image.convert("RGB").getextrema()
@@ -362,6 +368,7 @@ class _Engine:
             raise BackgroundError("请先 connect() 到已登录的远航版")
         guard = QueryGuard(self.backend, deadline, cancelled)
         started = time.monotonic()
+        copy_requested = False
         self.last_report = {"query": kind, "captcha_attempts": 0}
         try:
             with query_lease(self.backend.trader_pid):
@@ -388,7 +395,13 @@ class _Engine:
                 else:
                     grid = self.backend.grid()
                     sequence = self.backend.clipboard_sequence()
+                    allow = getattr(self.backend, "allow_query_captcha", None)
+                    if allow is not None:
+                        # Visibility permission lets us identify/cancel a query popup.
+                        # The option is checked before any foreground input below.
+                        allow(True)
                     self.last_report["phase"] = "request_copy"
+                    copy_requested = True
                     self.backend.copy_grid(grid)
                     self.last_report["phase"] = "wait_result"
                     result = self._finish_copy(sequence, kind, guard)
@@ -403,7 +416,25 @@ class _Engine:
         finally:
             self.last_report["seconds"] = round(time.monotonic() - started, 3)
             try:
-                self.backend.end_read()
+                try:
+                    cap = self.owned_captcha
+                    if cap is None and copy_requested:
+                        candidate = self.backend.captcha()
+                        if candidate is not None and self.backend.check_captcha(candidate):
+                            cap = candidate
+                    if cap is not None and self.backend.check_captcha(cap):
+                        self.backend.cancel_captcha(cap)
+                        cleanup_deadline = time.monotonic() + 2
+                        while self.backend.captcha() is not None and time.monotonic() < cleanup_deadline:
+                            time.sleep(self.options.poll_interval)
+                        if self.backend.captcha() is not None:
+                            raise BackgroundError("查询验证码未能关闭，请手动处理")
+                        self.owned_captcha = None
+                finally:
+                    self.backend.end_read()
+            except Exception as exc:
+                self.last_report.update(ok=False, cleanup_error=str(exc))
+                raise
             finally:
                 try:
                     guard.activation_guard = None
@@ -426,12 +457,10 @@ class _Engine:
 
 
 class BackgroundThsTrader:
-    """Readonly background mode for the existing Voyager login session.
+    """Readonly hidden-window queries; query captchas may briefly take focus.
 
-    close() stops the executor and leaves Voyager on its background desktop.
-    Call restore_windows() explicitly when window placement should be restored.
-    Windows Task View is window grouping, not a separate keyboard environment;
-    therefore this adapter never falls back to actual keyboard/mouse input.
+    close() stops the executor and leaves main windows hidden. Explicitly call
+    restore_windows() to display them again. No virtual desktop is managed.
     """
 
     def __init__(self, **options):

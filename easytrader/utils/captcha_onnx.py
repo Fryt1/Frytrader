@@ -1,29 +1,11 @@
 # -*- coding: utf-8 -*-
-"""同花顺验证码的 ONNX 快速识别通道。
+"""同花顺验证码的 ONNX 识别通道。
 
-为什么需要它
-============
-原先只有 tesseract 一条路：准确率够（本机真实样本 10/11），但每张要
-跑 6 次 OCR，约 330 ms。验证码存活时间短，这个延迟直接吃掉重试机会。
+模型来自 Fryt1/easyths 的同花顺验证码资产，模型及外部数据合计约 8.5MB。
+使用随包固定哈希权重、模型 metadata 字符表与 CTC 贪心解码，不调用
+Tesseract。热推理时间不包含截图、输入、确认或客户端响应。
 
-本模块加载一个按同花顺验证码字体训练的小模型（ONNX，4.3 MB），
-单张推理约 9 ms，比 tesseract 快 30 倍以上。
-
-**它不替代 tesseract**：在 11 张真实样本上，ONNX 82%、tesseract 91%，
-两者一致率 10/11 且一致时 9/10 正确。所以正确的用法是——
-
-1. 先跑 ONNX（9 ms）拿一个候选；
-2. 再跑 tesseract（330 ms）拿第二个候选；
-3. 两者一致就直接采信（覆盖绝大多数样本）；
-4. 不一致时以 tesseract 为准。
-
-这样既拿到 ONNX 的速度，又不牺牲 tesseract 已有的准确率。
-纯 ONNX 单独使用时准确性偏低，不要单独依赖它。
-
-依赖
-====
-只需要 ``onnxruntime`` / ``onnx`` / ``pillow``；不需要 torch——训练用的
-权重不在包内，包内只有导出后的 ONNX 模型。
+运行依赖为 numpy、Pillow、onnx、onnxruntime，不需要 PyTorch。
 """
 
 import hashlib

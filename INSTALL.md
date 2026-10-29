@@ -27,9 +27,9 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-验证码识别需要单独安装 Tesseract OCR，并确保 `tesseract.exe` 在 `PATH` 中，或在 `config.json` 的 `captcha.tesseract_path` 指定路径。
+同花顺查询验证码使用随包 ONNX 模型，无需安装 Tesseract。其他历史券商的 Tesseract 识别入口仍需自行配置。
 
-后台只读模式还需要 AutoHotkey v2，可通过 `python -m pip install -e ".[background]"` 安装 Python 依赖后再单独安装 AHK。程序不会在运行时自动下载或安装软件。
+后台只读查询采用同桌面隐藏窗口模式，不需要额外任务视图桌面、pyvda 或 AutoHotkey。验证码按需临时前台输入，结束后收起。`python -m pip install -e ".[background]"` 仍可作为兼容命令使用，程序不会在运行时自动下载或安装软件。
 
 ## 配置
 

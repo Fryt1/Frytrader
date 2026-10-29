@@ -50,7 +50,7 @@ setup(
     ],
     extras_require={
         "miniqmt": ["xtquant"],
-        "background": ["pyvda>=0.6.0,<0.7; sys_platform == 'win32'"],
+        "background": [],  # compatibility extra; no task-view desktop dependency
     },
     classifiers=[
         "Development Status :: 4 - Beta",

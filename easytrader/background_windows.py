@@ -1,27 +1,12 @@
 # -*- coding: utf-8 -*-
-"""同花顺远航版只读后台通道（任务视图虚拟桌面 + 定向控件消息）。
+"""同花顺同桌面只读查询：隐藏主窗口，验证码允许临时前台。
 
-边界
-----
-- 只操作已经登录运行的远航版：启动、关闭、登录都归用户。
-- 只发控件消息（SendMessageTimeoutW / PostMessageW），
-  不调用 SendInput、不抢焦点、不模拟键鼠、不调用 SwitchDesktop。
-- 任务视图虚拟桌面不是独立键盘环境。本模块只把远航版窗口
-  移到自己新建的桌面，用户桌面保持不变；恢复时只动自己创建的桌面。
-- 剪贴板只读取序号、文本和属主，不清空、不写入、不还原。
-- 依赖按需导入，非 Windows 上 import 本模块不会失败；
-  pyvda 是可选依赖，只有真正读写桌面时才需要。
-
-调用约定
---------
-``WindowsBackend`` 的公开方法在无法安全继续时抛出 ``RuntimeError``。
-``restore()`` 在从未 ``discover()`` 或从未进入后台时是幂等的空操作；
-真正的清理失败会抛出 ``RuntimeError``，不会静默报告成功。
+普通菜单/复制/截图使用定向控件消息；只允许已验证的查询验证码显示。
+不创建、移动、切换或删除任务视图桌面，不依赖 pyvda。
 """
 
 import math
 import os
-import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -29,7 +14,6 @@ from easytrader.config.client import CommonConfig
 
 VOYAGER_TITLE = "同花顺远航版"
 TRADER_TITLE_PREFIX = "网上股票交易系统5.0"
-DEFAULT_DESKTOP_NAME = "Frytrader 后台"
 
 QUERY_TREE_CLASS = "SysTreeView32"
 QUERY_TREE_ID = 129
@@ -55,11 +39,6 @@ SWP_NO_ACTIVATE_SHOW = 0x0057
 SMTO_ABORTIFHUNG = 0x0002
 SEND_TIMEOUT_MS = 800
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-# 移动窗口后等待附属下单窗口跟随的边界。
-FOLLOW_TIMEOUT_S = 1.5
-FOLLOW_POLL_S = 0.02
-
 
 @dataclass(frozen=True)
 class CaptchaControls:
@@ -113,19 +92,6 @@ def _parse_amount(raw, field: str) -> float:
     if not math.isfinite(value):
         raise RuntimeError("资金字段 %s 不是有限数字: %r" % (field, raw))
     return value
-
-
-def _desktop_name(value) -> str:
-    if not isinstance(value, str):
-        raise RuntimeError("desktop_name 必须是字符串")
-    name = value.strip()
-    if not name:
-        raise RuntimeError("desktop_name 不能为空")
-    if len(name) > 60:
-        raise RuntimeError("desktop_name 不能超过 60 个字符")
-    if "\x00" in name:
-        raise RuntimeError("desktop_name 不能包含空字符")
-    return name
 
 
 def _normalise_path(value) -> str:
@@ -308,6 +274,52 @@ class _Native:
             return None
         return int(value.value)
 
+    def restore_foreground(self, hwnd):
+        if not self.is_window(hwnd):
+            return False
+        import win32api
+        caller = win32api.GetCurrentThreadId()
+        foreground = self.foreground_window()
+        thread = self.thread_id(foreground) if foreground else 0
+        attached = False
+        try:
+            if thread and thread != caller:
+                self._process.AttachThreadInput(caller, thread, True)
+                attached = True
+            self._gui.SetForegroundWindow(int(hwnd))
+        except Exception:
+            return False
+        finally:
+            if attached:
+                self._process.AttachThreadInput(caller, thread, False)
+        return self.foreground_window() == hwnd
+
+    def hide(self, hwnd):
+        self._gui.ShowWindow(int(hwnd), 0)
+        if self.is_visible(hwnd):
+            raise RuntimeError("窗口未能隐藏: %s" % hwnd)
+
+    def input_desktop_name(self):
+        """只读检查 Windows 输入桌面（含锁屏/UAC）；不操作任务视图。"""
+        c, wt = self._ctypes, self._wt
+        self.user.OpenInputDesktop.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        self.user.OpenInputDesktop.restype = wt.HANDLE
+        self.user.GetUserObjectInformationW.argtypes = [wt.HANDLE, c.c_int, wt.LPVOID, wt.DWORD, c.POINTER(wt.DWORD)]
+        self.user.GetUserObjectInformationW.restype = wt.BOOL
+        self.user.CloseDesktop.argtypes = [wt.HANDLE]
+        self.user.CloseDesktop.restype = wt.BOOL
+        handle = self.user.OpenInputDesktop(0, False, 1)
+        if not handle:
+            raise RuntimeError("Windows 输入桌面不可访问，请先解除锁屏或安全提示")
+        try:
+            name = c.create_unicode_buffer(256)
+            needed = wt.DWORD()
+            if not self.user.GetUserObjectInformationW(handle, 2, name, c.sizeof(name), c.byref(needed)):
+                raise RuntimeError("无法读取 Windows 输入桌面名称")
+            return name.value
+        finally:
+            self.user.CloseDesktop(handle)
+
     def set_visible_no_activate(self, hwnd: int) -> bool:
         self._gui.SetWindowPos(int(hwnd), 0, 0, 0, 0, 0, SWP_NO_ACTIVATE_SHOW)
         return bool(self._gui.IsWindowVisible(int(hwnd)))
@@ -382,87 +394,15 @@ class _Native:
         return int(item.elem)
 
 
-class _Desktops:
-    """pyvda 的薄封装；每次调用都重新解析，避免跨线程 COM 指针。"""
-
-    def __init__(self):
-        try:
-            import pyvda
-        except Exception as exc:  # pragma: no cover - 环境缺依赖
-            raise RuntimeError("任务视图后台模式需要 pyvda: %s" % exc) from exc
-        self._pyvda = pyvda
-
-    def current_id(self) -> str:
-        return str(self._pyvda.VirtualDesktop.current().id)
-
-    def create(self, name: str) -> str:
-        desktop = self._pyvda.VirtualDesktop.create()
-        desktop_id = str(desktop.id)
-        try:
-            try:
-                desktop.rename(name)
-            except NotImplementedError:
-                pass
-        except BaseException:
-            current = self._pyvda.VirtualDesktop.current()
-            if str(current.id) != desktop_id and not desktop.apps_by_z_order(
-                include_pinned=False
-            ):
-                desktop.remove(fallback=current)
-            raise
-        return desktop_id
-
-    def _find(self, desktop_id: str):
-        for desktop in self._pyvda.get_virtual_desktops():
-            if str(desktop.id) == desktop_id:
-                return desktop
-        return None
-
-    def exists(self, desktop_id: str) -> bool:
-        return self._find(desktop_id) is not None
-
-    def view_desktop_id(self, hwnd: int) -> Optional[str]:
-        return str(self._pyvda.AppView(int(hwnd)).desktop_id)
-
-    def move(self, hwnd: int, desktop_id: str) -> None:
-        desktop = self._find(desktop_id)
-        if desktop is None:
-            raise RuntimeError("目标桌面已不存在")
-        self._pyvda.AppView(int(hwnd)).move(desktop)
-
-    def is_pinned(self, hwnd: int) -> bool:
-        view = self._pyvda.AppView(int(hwnd))
-        return bool(view.is_pinned()) or bool(view.is_app_pinned())
-
-    def apps(self, desktop_id: str) -> List[int]:
-        desktop = self._find(desktop_id)
-        if desktop is None:
-            return []
-        views = desktop.apps_by_z_order(include_pinned=False)
-        return [int(view.hwnd) for view in views]
-
-    def remove(self, desktop_id: str) -> bool:
-        desktop = self._find(desktop_id)
-        if desktop is None:
-            return False
-        current = self._pyvda.VirtualDesktop.current()
-        if str(current.id) == desktop_id:
-            # 删除当前桌面会让 Windows 切换桌面，这里直接拒绝。
-            raise RuntimeError("不能删除当前活动桌面")
-        desktop.remove(fallback=current)
-        return True
-
-
 class WindowsBackend:
     """远航版只读后台通道。
 
-    ``WindowsBackend()`` 只保存状态，不导入 Win32/pyvda，也不碰窗口；
+    ``WindowsBackend()`` 只保存状态，不导入 Win32，也不碰窗口；
     第一次真正用到时才建立原生绑定。
     """
 
-    def __init__(self, windows=None, desktops=None):
+    def __init__(self, windows=None):
         self._native_api = windows
-        self._desktop_api = desktops
         self.owner_hwnd = None
         self.trader_hwnd = None
         self.owner_pid = None
@@ -472,11 +412,11 @@ class WindowsBackend:
         self._original_caret = 0
         self._original_visible = True
         self._original_trader_visible = False
-        self._original_desktop_id = None
-        self._target_desktop_id = None
-        self._source_desktop_id = None
-        self._borrowed_desktop = False
-        self._working_desktop_id = None
+        self._hidden_active = False
+        self._query_captcha_allowed = False
+        self._captcha_input_active = False
+        self._input_captcha = None
+        self._return_foreground = 0
         self._activation_styles = {}
 
     # ------------------------------------------------------------------
@@ -487,22 +427,9 @@ class WindowsBackend:
             self._native_api = _Native()
         return self._native_api
 
-    def _desktops(self):
-        if self._desktop_api is None:
-            self._desktop_api = _Desktops()
-        return self._desktop_api
-
     def _require_discovered(self) -> None:
         if not self._discovered:
             raise RuntimeError("请先调用 discover() 连接已登录的同花顺远航版")
-
-    @property
-    def target_desktop_id(self) -> Optional[str]:
-        return self._target_desktop_id
-
-    @property
-    def source_desktop_id(self) -> Optional[str]:
-        return self._source_desktop_id
 
     # ------------------------------------------------------------------
     # 连接前检查
@@ -510,8 +437,8 @@ class WindowsBackend:
     def discover(self, exe_path=None) -> None:
         """绑定唯一一组远航版/下单窗口并记录原始状态。"""
         native = self._native()
-        if self._target_desktop_id is not None:
-            raise RuntimeError("后台桌面尚未恢复，请先调用 restore()")
+        if self._hidden_active:
+            raise RuntimeError("隐藏查询会话仍在使用，请先关闭或恢复窗口")
 
         owners = []
         traders = []
@@ -566,15 +493,6 @@ class WindowsBackend:
             )
         tree = trees[0]
         caret = self._caret(native, tree)
-        try:
-            original_desktop = self._desktops().view_desktop_id(owner)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(
-                "读取远航版所在任务视图桌面失败: %s" % exc
-            ) from exc
-
         self.owner_hwnd = owner
         self.trader_hwnd = trader
         self.owner_pid = owner_pid
@@ -583,12 +501,11 @@ class WindowsBackend:
         self._original_caret = caret
         self._original_visible = bool(native.is_visible(owner))
         self._original_trader_visible = bool(native.is_visible(trader))
-        self._original_desktop_id = original_desktop
         self._discovered = True
         return None
 
     def current_desktop_id(self) -> str:
-        return self._desktops().current_id()
+        return self._native().input_desktop_name()
 
     def foreground_pid(self) -> int:
         native = self._native()
@@ -620,207 +537,84 @@ class WindowsBackend:
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # 进入/退出后台桌面
-    # ------------------------------------------------------------------
-    def enter_background(self, desktop_name=DEFAULT_DESKTOP_NAME) -> None:
-        """只移动远航版窗口；归属的下单窗口会跟随。"""
+    def enter_background(self):
+        """只隐藏当前客户端窗口；不操作任务视图桌面。"""
         self._require_discovered()
-        if self._target_desktop_id is not None:
-            raise RuntimeError("后台桌面已经进入，请先调用 restore()")
-        name = _desktop_name(desktop_name)
+        if self._hidden_active:
+            raise RuntimeError("隐藏查询会话已经开始")
+        if not self.identity_ok():
+            raise RuntimeError("客户端窗口已改变")
         native = self._native()
-        desktops = self._desktops()
-        owner = self.owner_hwnd
-        if not native.is_window(owner):
-            raise RuntimeError("远航版窗口已关闭，请重新 discover()")
-        if native.process_id(owner) != self.owner_pid:
-            raise RuntimeError("远航版窗口已被其他进程占用")
-        try:
-            source = desktops.current_id()
-            owner_desktop = desktops.view_desktop_id(owner)
-            pinned = desktops.is_pinned(owner)
-        except RuntimeError as exc:
-            raise RuntimeError("读取任务视图桌面失败: %s" % exc) from exc
-        except Exception as exc:
-            raise RuntimeError("读取任务视图桌面失败: %s" % exc) from exc
-        if pinned:
-            raise RuntimeError("远航版已固定到所有桌面，未进入后台")
-        self._working_desktop_id = source
-        if owner_desktop != source:
-            if not native.cloaked(self.trader_hwnd):
-                raise RuntimeError("下单窗口未随远航版留在另一桌面")
-            self._borrowed_desktop = True
-            self._target_desktop_id = owner_desktop
-            self._source_desktop_id = owner_desktop
-            return None
-        self._borrowed_desktop = False
-        try:
-            target = desktops.create(name)
-        except Exception as exc:
-            raise RuntimeError("创建后台桌面失败: %s" % exc) from exc
-        self._target_desktop_id = target
-        self._source_desktop_id = source
-        try:
-            desktops.move(owner, target)
-            self._wait_follow(native, desktops, target)
-        except BaseException as exc:
-            problems = self._revert_entry(native, desktops)
-            if isinstance(exc, Exception):
-                message = "进入后台桌面失败: %s" % exc
-                if problems:
-                    message += "；回滚未完成: " + "；".join(problems)
-                raise RuntimeError(message) from exc
-            raise
-        return None
+        # 先隐藏附属窗口，再隐藏 owner，避免 owner 隐藏期间残留子窗口。
+        native.hide(self.trader_hwnd)
+        native.hide(self.owner_hwnd)
+        self._hidden_active = True
+        self.assert_background()
 
-    def _wait_follow(self, native, desktops, target: str) -> None:
-        deadline = time.monotonic() + FOLLOW_TIMEOUT_S
-        last_cloak = None
-        while True:
-            if desktops.current_id() != self._source_desktop_id:
-                raise RuntimeError("用户桌面在移动期间发生变化，已停止")
-            if not native.is_window(self.trader_hwnd):
-                raise RuntimeError("下单窗口在移动期间消失")
-            if native.process_id(self.trader_hwnd) != self.trader_pid:
-                raise RuntimeError("下单窗口在移动期间被其他进程占用")
-            last_cloak = native.cloaked(self.trader_hwnd)
-            try:
-                followed = desktops.view_desktop_id(self.owner_hwnd) == (
-                    target
-                )
-            except Exception:
-                followed = False
-            if last_cloak and followed:
-                return
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    "下单窗口未随远航版进入后台桌面（DWM cloak=%s）"
-                    % last_cloak
-                )
-            time.sleep(FOLLOW_POLL_S)
-
-    def restore(self) -> None:
-        """只恢复自己移动的窗口；未进入后台时不操作客户端。"""
-        if not self._discovered or self._target_desktop_id is None:
-            return None
-        if self._borrowed_desktop:
-            self._target_desktop_id = None
-            self._source_desktop_id = None
-            self._borrowed_desktop = False
-            return None
+    def restore(self):
+        """显式恢复连接前可见性。调用者主动要求显示时才使用。"""
+        if not self._discovered or not self._hidden_active:
+            return
+        if self.captcha():
+            raise RuntimeError("仍有查询验证码，未自动显示主窗口")
+        errors = self._restore_caret(self._native())
+        if errors:
+            raise RuntimeError("；".join(errors))
         native = self._native()
-        desktops = self._desktops()
-        problems = []
-        ours = False
-        try:
-            ours = self._matches(native, self.owner_hwnd, self.owner_pid) and (
-                desktops.view_desktop_id(self.owner_hwnd)
-                == self._target_desktop_id
-            )
-        except Exception as exc:
-            problems.append("无法确认窗口桌面归属: %s" % exc)
-        if ours:
-            problems.extend(self._restore_caret(native))
-            problems.extend(self._restore_owner_desktop(native, desktops))
-            problems.extend(self._restore_visibility(native))
-        problems.extend(self._remove_target(native, desktops))
-        if self._target_desktop_id is None:
-            self._source_desktop_id = None
-        if problems:
-            raise RuntimeError("；".join(problems))
-        return None
-
-    def _revert_entry(self, native, desktops) -> List[str]:
-        problems = []
-        target = self._target_desktop_id
-        if target is None:
-            return problems
-        owner = self.owner_hwnd
-        try:
-            if native.is_window(owner) and (
-                desktops.view_desktop_id(owner) == target
-            ):
-                desktops.move(owner, self._source_desktop_id)
-        except Exception as exc:
-            problems.append("恢复远航版窗口失败: %s" % exc)
-        problems.extend(self._remove_target(native, desktops))
-        if self._target_desktop_id is None:
-            self._source_desktop_id = None
-        return problems
-
-    def _restore_owner_desktop(self, native, desktops) -> List[str]:
-        target = self._target_desktop_id
-        if target is None:
-            return []
-        owner = self.owner_hwnd
-        if not self._matches(native, owner, self.owner_pid):
-            return []
-        try:
-            current = desktops.view_desktop_id(owner)
-        except Exception as exc:
-            return ["无法读取远航版所在桌面: %s" % exc]
-        if current != target:
-            # 用户已自行移动，保持现状。
-            return []
-        try:
-            desktops.move(owner, self._source_desktop_id)
-        except Exception as exc:
-            return ["远航版未能移回原桌面: %s" % exc]
-        return []
-
-    def _remove_target(self, native, desktops) -> List[str]:
-        target = self._target_desktop_id
-        if target is None:
-            return []
-        try:
-            if not desktops.exists(target):
-                self._target_desktop_id = None
-                return []
-            if desktops.current_id() == target:
-                return ["后台桌面仍处于活动状态，已保留未删除"]
-            leftover = desktops.apps(target)
-            if leftover:
-                problems = []
-                if self._has_our_window(native, leftover):
-                    problems.append("远航版或其下单窗口仍留在后台桌面")
-                return problems
-            desktops.remove(target)
-        except Exception as exc:
-            return ["删除后台桌面失败: %s" % exc]
-        self._target_desktop_id = None
-        return []
-
-    def _has_our_window(self, native, handles) -> bool:
-        ours = {self.owner_pid, self.trader_pid}
-        for hwnd in handles:
-            try:
-                if native.process_id(hwnd) in ours:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _restore_visibility(self, native) -> List[str]:
-        problems = []
-        for hwnd, pid, was_visible in (
-            (self.owner_hwnd, self.owner_pid, self._original_visible),
-            (self.trader_hwnd, self.trader_pid, self._original_trader_visible),
+        for hwnd, visible, pid in (
+            (self.owner_hwnd, self._original_visible, self.owner_pid),
+            (self.trader_hwnd, self._original_trader_visible, self.trader_pid),
         ):
-            if not was_visible or not self._matches(native, hwnd, pid):
-                continue
-            if native.is_visible(hwnd):
-                continue
-            try:
-                if not native.set_visible_no_activate(hwnd):
-                    problems.append("恢复窗口显示状态失败")
-            except Exception as exc:
-                problems.append("恢复窗口显示状态失败: %s" % exc)
-        return problems
+            if self._matches(native, hwnd, pid):
+                if visible:
+                    native.set_visible_no_activate(hwnd)
+                else:
+                    native.hide(hwnd)
+        self._hidden_active = False
 
-    # ------------------------------------------------------------------
-    # 查询菜单
-    # ------------------------------------------------------------------
+    def allow_query_captcha(self, allowed):
+        self._query_captcha_allowed = bool(allowed)
+
+    def begin_captcha_input(self, controls):
+        if not self._query_captcha_allowed or not self.check_captcha(controls):
+            raise RuntimeError("验证码输入未授权")
+        self._captcha_input_active = True
+        self._input_captcha = controls
+
+    def foreground_permitted(self, foreground=None):
+        """验证码及关闭后隐藏 owner 的短暂过渡，均不允许主窗口显示。"""
+        if not self._query_captcha_allowed:
+            return False
+        native = self._native()
+        if foreground is None:
+            foreground = native.foreground_window()
+        cap = self.captcha()
+        if cap and self.check_captcha(cap):
+            if foreground in (cap.dialog, cap.editor, cap.ok, cap.cancel, cap.image):
+                return True
+        cap = self._input_captcha
+        if self._captcha_input_active and cap and self.check_captcha(cap):
+            if foreground in (cap.dialog, cap.editor, cap.ok, cap.cancel, cap.image):
+                return True
+        return bool(
+            self._captcha_input_active
+            and foreground in (self.owner_hwnd, self.trader_hwnd)
+            and not native.is_visible(foreground)
+        )
+
+    def assert_query_foreground(self):
+        native = self._native()
+        foreground = native.foreground_window()
+        if not foreground:
+            return
+        try:
+            pid = native.process_id(foreground)
+        except Exception:
+            return  # foreground was destroyed between the two Win32 calls
+        if pid in (self.owner_pid, self.trader_pid) and not self.foreground_permitted(foreground):
+            raise RuntimeError("非验证码客户端窗口占用了前台（hwnd=%s）" % foreground)
+
+
     def select_page(self, path) -> None:
         items = _menu_path(path)
         self._require_discovered()
@@ -977,7 +771,7 @@ class WindowsBackend:
                     continue
                 if native.class_name(hwnd) != CAPTCHA_DIALOG_CLASS:
                     continue
-                if not native.is_visible(hwnd) and not native.cloaked(hwnd):
+                if not native.is_visible(hwnd):
                     continue
                 image = native.dlg_item(hwnd, CAPTCHA_IMAGE_ID)
                 editor = native.dlg_item(hwnd, CAPTCHA_EDITOR_ID)
@@ -1052,75 +846,51 @@ class WindowsBackend:
         return self.trader_hwnd, self.trader_pid, thread
 
     def assert_background(self):
-        """Read-only check; never try to fix placement after interference."""
-        if not self.identity_ok() or self._target_desktop_id is None:
-            raise RuntimeError("后台会话或窗口身份已失效")
-        desktops = self._desktops()
-        if desktops.current_id() == self._target_desktop_id:
-            raise RuntimeError("客户端桌面已成为当前桌面")
-        if (
-            desktops.view_desktop_id(self.owner_hwnd)
-            != self._target_desktop_id
-        ):
-            raise RuntimeError("远航版已离开后台桌面")
+        """主窗口必须隐藏；只允许本次查询的验证码临时可见。"""
+        if not self.identity_ok() or not self._hidden_active:
+            raise RuntimeError("隐藏查询会话或窗口身份已失效")
         native = self._native()
-        pids = {self.owner_pid, self.trader_pid}
+        cap = self.captcha() if self._query_captcha_allowed else None
+        permitted = cap.dialog if cap and self.check_captcha(cap) else None
         for hwnd in native.enumerate_top():
             try:
-                if native.process_id(hwnd) not in pids:
+                if native.process_id(hwnd) not in (self.owner_pid, self.trader_pid):
                     continue
-                if not native.is_visible(hwnd):
-                    continue
-                cloaked = native.cloaked(hwnd)
+                if native.is_visible(hwnd) and hwnd != permitted:
+                    raise RuntimeError("客户端出现了非验证码可见窗口，查询已停止")
+            except RuntimeError:
+                raise
             except Exception:
                 if native.is_window(hwnd):
-                    raise RuntimeError("无法确认客户端窗口是否被遮蔽")
-                continue
-            if not cloaked:
-                raise RuntimeError(
-                    "客户端有可见且未遮蔽的窗口，后台操作已停止"
-                )
+                    raise RuntimeError("无法确认客户端窗口可见性")
 
     def ensure_render_ready(self):
-        """Show only the cloaked trader, with NOACTIVATE + CBT active."""
-        native = self._native()
-        if not self.identity_ok() or not native.cloaked(self.trader_hwnd):
-            raise RuntimeError("下单窗口未留在后台桌面")
-        if not native.is_visible(self.trader_hwnd):
-            if not native.set_visible_no_activate(self.trader_hwnd):
-                raise RuntimeError("后台下单窗口的可绘图状态未就绪")
+        # 隐藏状态直接依靠控件消息与内存绘图，绝不自动显示主窗口。
+        self.assert_background()
 
     def begin_read(self):
-        self._protect_window(self.owner_hwnd, self.owner_pid)
-        self._protect_window(self.trader_hwnd, self.trader_pid)
+        self.assert_background()
+        self._captcha_input_active = False
+        foreground = self._native().foreground_window()
+        if foreground and self.foreground_pid() not in (self.owner_pid, self.trader_pid):
+            self._return_foreground = foreground
 
     def protect_captcha(self, controls):
-        if not self.check_captcha(controls):
-            raise RuntimeError("验证码窗口身份已改变")
-        self._protect_window(controls.dialog, self.trader_pid)
+        if not self._query_captcha_allowed or not self.check_captcha(controls):
+            raise RuntimeError("不是本次查询已允许的验证码")
 
     def end_read(self):
+        # 收起主窗口。未识别的弹窗只报告失败，不擅自确认或关闭。
         native = self._native()
-        errors = []
-        for hwnd, (pid, originally_set) in list(
-            self._activation_styles.items()
-        ):
-            if not self._matches(native, hwnd, pid):
-                continue
-            try:
-                current = native.ex_style(hwnd)
-                restored = (
-                    current | 0x08000000
-                    if originally_set
-                    else current & ~0x08000000
-                )
-                if restored != current:
-                    native.set_ex_style(hwnd, restored)
-            except Exception as exc:
-                errors.append(str(exc))
-        self._activation_styles.clear()
-        if errors:
-            raise RuntimeError("恢复防激活样式失败: " + "; ".join(errors))
+        for hwnd, pid in ((self.trader_hwnd, self.trader_pid), (self.owner_hwnd, self.owner_pid)):
+            if self._matches(native, hwnd, pid):
+                native.hide(hwnd)
+        self._query_captcha_allowed = False
+        if self._captcha_input_active and self.foreground_pid() in (self.owner_pid, self.trader_pid):
+            if not self._return_foreground or not native.restore_foreground(self._return_foreground):
+                raise RuntimeError("查询完成但未能归还前台焦点，请手动切回工作窗口")
+        self._captcha_input_active = False
+        self._input_captcha = None
 
     def capture_captcha(self, image_hwnd: int):
         self._require_discovered()
@@ -1140,6 +910,5 @@ class WindowsBackend:
         """Cancel only the known query captcha by notification."""
         if not self.check_captcha(caps):
             raise RuntimeError("验证码控件已改变，未发送取消通知")
-        self._native().send_timeout(
-            caps.dialog, WM_COMMAND, CAPTCHA_CANCEL_ID, caps.cancel
-        )
+        if not self._native().post_message(caps.cancel, 0x00F5):
+            raise RuntimeError("发送查询验证码取消失败")
